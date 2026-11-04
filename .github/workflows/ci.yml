@@ -1,0 +1,34 @@
+name: CI
+# Lint and test every push and pull request. The Release workflow runs the same checks before it publishes.
+on:
+  push:
+  pull_request:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            python: "3.8"   # the oldest Python the README promises
+          - os: ubuntu-latest
+            python: "3.12"
+          - os: windows-latest
+            python: "3.12"  # most people run it on Windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install test tools
+        run: python -m pip install pytest ruff
+      - name: Lint
+        run: ruff check .
+      - name: Every file compiles
+        run: python -m compileall -q main.py engine.py broker.py tray.py icon_data.py
+      - name: Tests
+        run: python -m pytest -q tests

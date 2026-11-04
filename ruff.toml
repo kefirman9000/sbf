@@ -1,0 +1,7 @@
+# Lint rules CI enforces: real errors only (syntax, undefined names, unused imports), not style.
+target-version = "py38"
+line-length = 120
+
+[lint]
+select = ["E9", "F"]
+ignore = ["F841"]  # a few unused locals are left on purpose next to calls with side effects

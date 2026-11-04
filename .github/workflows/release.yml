@@ -1,0 +1,48 @@
+name: Release
+# Publishes a GitHub release with a ready-to-run zip whenever VERSION changes on main.
+on:
+  push:
+    branches: [main]
+    paths: [VERSION]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml  # never publish a release that fails lint or tests
+  release:
+    needs: checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read version
+        id: v
+        run: echo "version=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
+      - name: Skip if this version is already released
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v${{ steps.v.outputs.version }}" >/dev/null 2>&1; then echo "exists=1" >> "$GITHUB_OUTPUT"; fi
+      - name: Build zip and notes
+        if: steps.check.outputs.exists != '1'
+        run: |
+          V=${{ steps.v.outputs.version }}
+          mkdir -p dist/SBF
+          cp main.py engine.py broker.py icon_data.py tray.py VERSION README.md CHANGELOG.md requirements.txt "Run SBF.bat" SBF.pyw dist/SBF/
+          (cd dist && zip -qr "SBF-$V.zip" SBF)
+          # the app checks every download against this before installing it
+          (cd dist && sha256sum "SBF-$V.zip" > "SBF-$V.zip.sha256")
+          {
+            echo "**Download:** \`SBF-$V.zip\` below. Extract the whole folder and double-click **Run SBF.bat** (Windows) or run \`python3 main.py\`."
+            echo "Already have SBF? Use the **Update** button in the app instead."
+            echo
+            awk -v v="$V" '/^## /{p = ($2 == v)} p' CHANGELOG.md
+          } > dist/notes.md
+      - name: Publish release
+        if: steps.check.outputs.exists != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V=${{ steps.v.outputs.version }}
+          gh release create "v$V" "dist/SBF-$V.zip" "dist/SBF-$V.zip.sha256" --title "SBF $V" --notes-file dist/notes.md --target "${{ github.sha }}"
