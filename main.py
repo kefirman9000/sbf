@@ -70,7 +70,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 APP_SHORT = "SBF"
 CONFIG_PATH = os.path.join(E.HOME_DIR, "config.json")
 
-COINS = ["SPY", "QQQ", "IWM", "AAPL", "NVDA", "TSLA", "AMD", "MSFT", "AMZN", "META"]  # tickers
+COINS = ["SPY", "QQQ", "IWM", "AAPL", "NVDA", "TSLA", "AMD", "MSFT", "AMZN", "META",
+         "SPYU", "TQQQ", "SQQQ"]  # tickers (the last three: leveraged and inverse ETFs, see E.LEVERAGED)
 MIN_LIVE_ORDER = 2.0   # USD; smaller live buys are skipped
 MAX_FAILS = 3          # consecutive order failures before auto-stop
 BAR_CHOICES = E.BAR_CHOICES
@@ -128,7 +129,8 @@ SETTING_GROUPS = [
         ("max_coin_pct", "Limit per ticker: never have more than this % of your starting money in any single stock. "
                          "Example: 30 with $1,000 = at most $300 in SPY", float),
         ("stop_loss", "Safety stop: automatically sell a stock if it falls this % below the price you paid. "
-                      "Example: 5 = sell if a $100 position drops to $95 (0 = off)", float),
+                      "Example: 5 = sell if a $100 position drops to $95 (0 = off). On a leveraged ETF it's the ETF's own "
+                      "price: 5% on SPYU (4x) is about a 1.25% move in the S&P 500", float),
         ("take_profit", "Lock in profit: automatically sell a stock once it is up this % on what you paid. "
                         "Example: 10 = sell when a $100 position reaches $110 (0 = off)", float),
         ("trail_stop", "Trailing stop: sell a stock if it falls this % from its highest price since you bought it. "
@@ -2332,19 +2334,22 @@ class App:
         top.pack(fill="x")
         ttk.Label(top, text="Popular stocks and ETFs (type any other ticker below)", font=("", 12, "bold")).pack(anchor="w")
         ttk.Label(top, foreground=MUTED, wraplength=680, text=(
-            "Busiest first. Tick the ones you want and press Add. Small coins with little volume have wider "
-            "spreads and jump around more, which can eat into profits.")).pack(anchor="w", pady=(2, 6))
+            "Busiest first. Tick the ones you want and press Add. Thinly traded stocks have wider spreads and jump "
+            "around more, which can eat into profits. Leveraged ETFs (like SPYU, 4x the S&P 500) make bigger moves; "
+            "inverse ones (like SQQQ) rise when their index falls, so the buy-only bots can profit on down days too. "
+            "Both reset daily, so held for days they drift from their multiple.")).pack(anchor="w", pady=(2, 6))
         row = ttk.Frame(top)
         row.pack(fill="x")
         ttk.Label(row, text="Search").pack(side="left")
         q = tk.StringVar()
         ttk.Entry(row, textvariable=q, width=16).pack(side="left", padx=6)
-        status = ttk.Label(row, text="Loading the coin list...", foreground=MUTED)
+        status = ttk.Label(row, text="Loading the ticker list...", foreground=MUTED)
         status.pack(side="left", padx=8)
         mid = ttk.Frame(w, padding=(10, 0))
         mid.pack(fill="both", expand=True)
-        t = self.make_tree(mid, ("coin", "price", "chg", "vol", "have"), (80, 120, 100, 150, 120),
-                           ("Ticker", "Price", "Today", "Volume today ($)", "In your list"))
+        t = self.make_tree(mid, ("coin", "kind", "price", "chg", "vol", "have"), (70, 170, 90, 80, 140, 90),
+                           ("Ticker", "What it is", "Price", "Today", "Volume today ($)", "In your list"))
+        t.column("kind", anchor="w")
         t.configure(selectmode="extended")
         data = {"all": []}
 
@@ -2357,7 +2362,7 @@ class App:
                     continue
                 pr = d["price"]
                 t.insert("", "end", iid=d["coin"], values=(
-                    d["coin"], "-" if pr is None else (f"{pr:,.6f}" if pr < 1 else f"{pr:,.2f}"),
+                    d["coin"], d.get("kind") or E.kind_text(d["coin"]) or "stock / ETF", "-" if pr is None else (f"{pr:,.6f}" if pr < 1 else f"{pr:,.2f}"),
                     "-" if d["change_24h"] is None else f"{d['change_24h']:+.2f}%",
                     "-" if d["volume_usd"] is None else f"{d['volume_usd']:,.0f}",
                     "yes" if d["coin"] in mine else ""))
@@ -2371,7 +2376,7 @@ class App:
                 status.config(text=f"Couldn't load the list: {err}", foreground=RED)
                 return
             data["all"] = items
-            status.config(text=f"{len(items)} coins")
+            status.config(text=f"{len(items)} tickers")
             fill()
 
         def work():
@@ -2386,17 +2391,17 @@ class App:
         def add_sel():
             sel = list(t.selection())
             if not sel:
-                return messagebox.showinfo("Coins", "Select one or more coins first (Ctrl/Shift-click for several).", parent=w)
+                return messagebox.showinfo("Tickers", "Select one or more tickers first (Ctrl/Shift-click for several).", parent=w)
             added = self.add_coins(sel)
-            self.write(f"Added {', '.join(added)} to your coins." if added else f"Ticked {', '.join(sel)}.")
+            self.write(f"Added {', '.join(added)} to your tickers." if added else f"Ticked {', '.join(sel)}.")
             fill()
 
         def remove_sel():
             gone = [c for c in t.selection() if c in self.settings["extra_coins"]]
             if not gone:
-                return messagebox.showinfo("Coins", "Select coins you added yourself. The 10 built-in coins stay.", parent=w)
+                return messagebox.showinfo("Tickers", f"Select tickers you added yourself. The {len(COINS)} built-in ones stay.", parent=w)
             if self.session and set(gone) & set(self.session_coins):
-                return messagebox.showinfo("Coins", "That coin is in the running session. Reset the session first.", parent=w)
+                return messagebox.showinfo("Tickers", "That ticker is in the running session. Reset the session first.", parent=w)
             self.settings["extra_coins"] = [c for c in self.settings["extra_coins"] if c not in gone]
             for c in gone:
                 self.coin_vars.pop(c, None)
@@ -2889,6 +2894,9 @@ class App:
             "Share: a small piece of a company (or of a fund, for ETFs like SPY). SBF can buy part of a share, so any "
             "trade size works on any stock.\n"
             "ETF: a fund that trades like a stock. SPY follows the S&P 500, QQQ the Nasdaq 100.\n"
+            "Leveraged ETF: moves a multiple of its index each day (SPYU 4x the S&P 500, TQQQ 3x the Nasdaq 100). Inverse "
+            "ETF: moves the opposite way (SQQQ rises 3% when the Nasdaq 100 falls 1%), so buy-only bots can profit on down "
+            "days. Both reset daily: held for days they drift from their multiple, and choppy markets wear them down.\n"
             "Bid / ask: what buyers pay / sellers want. A wide gap between them means a thin, costly stock to trade.\n"
             "Limit order: buy or sell only at this price or better. Market order: right now, at whatever the price is.\n"
             "Short selling: selling shares you don't own. SBF never does it.\n"
@@ -4198,6 +4206,10 @@ class App:
 
     def _seed(self, coins, bar_min, wild, fee, pct, evolve):
         gran = E.candle_gran(bar_min)
+        for _ in range(40):  # a saved login still connecting: wait for it (history comes from Alpaca) up to 20 s
+            if E.ALPACA.get("key") or not self.logging_in:
+                break
+            time.sleep(0.5)
         if bar_min < 1:
             self.q.put(("log", (f"Loading history. Nothing shorter than 1-minute bars is offered, so the bots warm up "
                                 f"on those and switch to real {E.fmt_bar(bar_min)} bars as live prices arrive.", "info")))
@@ -4939,12 +4951,28 @@ class App:
             self.usd_avail = self.avail()
             self.logging_in = False
             self.update_status()
+            short = min((len(self.hist.get(c) or []) for c in self.session_coins), default=0) if self.session_coins else 0
+            if self.running and self.seeded and self.session_coins and short < 120:
+                # started without history (no login yet): load it now, for the same farm, so the bots see a full chart
+                self._restored_farm, self.seeded = self.tourn, False
+                self.write("Logged in: loading the price history the bots missed (your farm carries on as it was).")
+                self.launch_worker()
             self.write(f"Logged in to Alpaca ({'PAPER' if E.ALPACA.get('paper', True) else 'LIVE'}). Buying power: ${self.usd_avail:,.2f} "
                        f"")
         elif kind == "balances":
             self.balances = data
             self.usd_avail = self.avail()
             self.update_status()
+        elif kind == "saved_login_rejected":
+            self.logging_in = False
+            self.update_status()
+            self.write("Your saved Alpaca key was rejected (it may have been regenerated or revoked), so it was forgotten. "
+                       "Log in again with your current key and tick Remember: until then there are no prices.", "bad")
+            if not self.tray_mode:
+                messagebox.showwarning("Saved key rejected", "Alpaca didn't accept the key saved on this computer (it may "
+                                       "have been regenerated or revoked), so it was forgotten.\n\nPlease log in with "
+                                       "your current key and tick 'Remember'. Until then the bots have no prices.")
+                self.open_login()
         elif kind == "login_failed":
             self.logging_in = False
             self.update_status()
@@ -9410,7 +9438,7 @@ class App:
             E.note_error("auto_login")
         if creds and not self.client:
             self.write("Saved Alpaca login found, connecting...")
-            self.start_login(*creds, remember=False)
+            self.start_login(*creds, remember=False, saved=True)
 
     def open_login(self):
         if self.client:
@@ -9459,16 +9487,20 @@ class App:
         ttk.Button(row, text="Cancel", command=w.destroy).pack(side="left", padx=4)
         ttk.Button(row, text="Log in", style="Accent.TButton", command=go).pack(side="left")
 
-    def start_login(self, key, secret, paper=True, remember=False):
+    def start_login(self, key, secret, paper=True, remember=False, saved=False):
         self.logging_in = True
         self.update_status()
-        threading.Thread(target=self._connect, args=(key, secret, paper, remember), daemon=True).start()
+        threading.Thread(target=self._connect, args=(key, secret, paper, remember, saved), daemon=True).start()
 
-    def _connect(self, key, secret, paper, remember):
+    def _connect(self, key, secret, paper, remember, saved=False):
         creds = dict(key=key, secret=secret, paper=bool(paper))
         try:
             acct = E.alp_account(creds)
         except Exception as e:
+            low = str(e).lower()
+            if saved and ("401" in low or "403" in low or "unauthorized" in low or "forbidden" in low):
+                E.clear_login()  # a dead key: forget it, so the next start doesn't fail the same way
+                return self.q.put(("saved_login_rejected", E.explain_login_error(e, secret)))
             return self.q.put(("login_failed", E.explain_login_error(e, secret)))
         E.ALPACA.update(creds)
         if remember and not E.save_login(key, secret, paper):

@@ -3244,6 +3244,11 @@ def is_exam_day(d):
     return int(hashlib.md5(("sbf-exam-" + d.isoformat()).encode()).hexdigest(), 16) % 5 == 0
 
 
+def exam_trades(v):
+    """Trades a bot made in its exams (Free roam tests and day replays on days it never trained on)."""
+    return sum(int(x.get("n", 0) or 0) for x in (getattr(v, "exams", None) or []) if isinstance(x, dict))
+
+
 def add_exam(v, kind, edge, n, when=None, gran=None):
     """Records one exam (edge: % result on unseen prices, vs the market where there is one; n: its trades; gran: the
     candle size it was tested on, which is always the candle size it lives on)."""
@@ -4412,12 +4417,45 @@ class Tournament:
         """Still within its first window of decisions: too new to judge, so never dropped to make room."""
         return self.score(v) is None and v.age < self.window_for(v.tf)
 
+    def contender(self, v):
+        """How close this bot is to earning a vote, or None when it isn't on course: it passed its exams, or its
+        exams so far are positive and it isn't behind just holding. Bigger = closer."""
+        if is_kami(v) or v.origin == "team":
+            return None
+        verdict, d = exam_verdict(v, self.serial)
+        if verdict == "failed" or not d.get("k"):
+            return None
+        lf = self.life(v)
+        if verdict == "passed":
+            return 10.0 + (d.get("score") or 0.0)
+        if (d.get("mean") or 0) <= 0 or (lf["edge"] is not None and lf["edge"] < 0):
+            return None
+        return float(d.get("mean") or 0.0) + 0.1 * (v.wins + v.losses + exam_trades(v))
+
+    def protected(self):
+        """Bots on course to earn a vote, kept off the retirement and make-room lists so they live long enough to
+        finish their record (at most a third of the farm, closest first, so the farm keeps evolving)."""
+        key = (self.n, len(self.vars), self.serial)
+        if getattr(self, "_prot_key", None) == key:
+            return self._prot
+        if not self.o.get("proven_only", True):
+            out = set()
+        else:
+            c = [(self.contender(v), v) for v in self.vars]
+            c = sorted(((x, v) for x, v in c if x is not None), key=lambda xv: -xv[0])
+            out = {id(v) for _, v in c[:max(1, self.cap // 3)]}
+        self._prot_key, self._prot = key, out
+        return out
+
     def weakest(self):
         """Who goes first when room is needed, as (bot, score) pairs: bots that have had a full window and still
         can't be scored (they hardly trade) first, then the scored ones from the bottom of the ranking. Bots too young
-        to judge are left alone, so new eggs get their chance and the farm doesn't fill with unjudged eggs."""
-        stuck = sorted((v for v in self.vars if self.score(v) is None and not self.young(v)), key=lambda v: len(v.sim.tbars))
-        return [(v, None) for v in stuck] + list(reversed(self.ranking()))
+        to judge are left alone, so new eggs get their chance and the farm doesn't fill with unjudged eggs, and so are
+        contenders for a vote (see protected)."""
+        keep = self.protected()
+        stuck = sorted((v for v in self.vars if self.score(v) is None and not self.young(v) and id(v) not in keep),
+                       key=lambda v: len(v.sim.tbars))
+        return [(v, None) for v in stuck] + [(v, x) for v, x in reversed(self.ranking()) if id(v) not in keep]
 
     def trim_to_cap(self):
         """Brings an overfull farm back down to its size (bots that can't be judged, then the weakest). -> removed"""
@@ -4460,20 +4498,35 @@ class Tournament:
         pretend money until it gets there. With the gate off (Settings), every winning bot may."""
         if not self.o.get("proven_only", True):
             return True
-        if is_kami(v):
-            return False
+        return not self.proven_gaps(v)
+
+    def proven_gaps(self, v):
+        """What this bot still lacks before it may trade the account, in plain words ([] = proven)."""
         if v.origin == "team":  # bots you picked yourself to trade with (My team / Hall of Fame only)
-            return True
-        if v.wins + v.losses < int(self.o.get("proven_trades", 8) or 0):
-            return False
-        if v.age < self.window_for(v.tf):  # it has lived through at least one full scoring window of its own
-            return False
+            return []
+        kami = is_kami(v)
+        if kami and not self.o.get("proven_kamikazes", False):
+            return ["kamikazes don't trade the account"]
+        gaps = []
+        need = int(self.o.get("proven_trades", 8) or 0)
+        closed = v.wins + v.losses + exam_trades(v)  # trades on days it never trained on count: they're the best evidence
+        if closed < need:
+            gaps.append(f"{need - closed} more finished trade{'s' if need - closed != 1 else ''}")
+        window = self.window_for(v.tf)
+        if v.age < window:  # it has lived through at least one full scoring window of its own
+            gaps.append(f"{window - v.age} more decisions on the farm")
         lf = self.life(v)
-        if lf["ret"] <= 0 or (lf["edge"] is not None and lf["edge"] <= 0):
-            return False
-        if self.o.get("proven_exam", True) and exam_verdict(v, self.serial)[0] != "passed":
-            return False
-        return True
+        if lf["ret"] <= 0:
+            gaps.append(f"a lifetime profit (now {lf['ret'] * 100:+.1f}%)")
+        elif lf["edge"] is not None and lf["edge"] <= 0:
+            gaps.append(f"to beat just holding (now {lf['edge'] * 100:+.1f}% vs holding)")
+        if self.o.get("proven_exam", True) and not kami:  # (kamikazes aren't examined: their record is their proof)
+            verdict, d = exam_verdict(v, self.serial)
+            if verdict == "failed":
+                gaps.append("to stop failing its exams")
+            elif verdict != "passed":
+                gaps.append(f"passed exams ({d['k']} of at least {EXAM_MIN} taken)")
+        return gaps
 
     def proven_bots(self):
         return [v for v in self.vars if self.proven(v)]
@@ -4637,7 +4690,10 @@ class Tournament:
             elif st == "slowed":
                 v.strikes += 0.5
         retired = 0
+        keep = self.protected()
         for v in sorted(self.vars, key=lambda x: -x.strikes):
+            if id(v) in keep:  # on course to earn a vote: let it finish its record
+                continue
             if v.strikes >= self.retire_after and sum(1 for x in self.vars if x.name == v.name) > 1:
                 self._remove(v, "retired (kept losing)")
                 retired += 1
@@ -6076,9 +6132,34 @@ def scan_scalps(job):
 
 # ---------------- Bot Lab: evolve on old prices, test on newer unseen prices ----------------
 # ---------------- popular tickers ----------------
+# Leveraged and inverse ETFs (and ETNs): ticker -> (daily multiple, what it follows). A 3x fund moves about 3% when its
+# index moves 1%; an inverse one (negative) RISES when its index falls, so a buy-only bot can still profit on a down day.
+# They reset every day, so held for days they drift away from the multiple (choppy markets wear them down).
+LEVERAGED = {
+    "SPYU": (4, "S&P 500"), "UPRO": (3, "S&P 500"), "SPXL": (3, "S&P 500"), "SSO": (2, "S&P 500"),
+    "TQQQ": (3, "Nasdaq-100"), "QLD": (2, "Nasdaq-100"), "SOXL": (3, "chip stocks"), "TNA": (3, "Russell 2000"),
+    "SPXU": (-3, "S&P 500"), "SPXS": (-3, "S&P 500"), "SDS": (-2, "S&P 500"), "SH": (-1, "S&P 500"),
+    "SQQQ": (-3, "Nasdaq-100"), "PSQ": (-1, "Nasdaq-100"), "SOXS": (-3, "chip stocks"), "TZA": (-3, "Russell 2000"),
+}
+
+
+def leverage(c):
+    """How many times its index's daily move this ticker makes (1 for an ordinary stock or ETF)."""
+    return abs(LEVERAGED.get(c, (1, ""))[0])
+
+
+def kind_text(c):
+    """'4x S&P 500', '-3x Nasdaq-100 (inverse)', or '' for an ordinary stock."""
+    x = LEVERAGED.get(c)
+    if not x:
+        return ""
+    m, what = x
+    return f"{m:+d}x {what}".lstrip("+") + (" (inverse)" if m < 0 else "")
+
+
 POPULAR = ["SPY", "QQQ", "IWM", "DIA", "AAPL", "NVDA", "TSLA", "AMD", "MSFT", "AMZN", "META", "GOOGL", "NFLX", "PLTR",
            "COIN", "MSTR", "SMCI", "AVGO", "BA", "JPM", "BAC", "XOM", "INTC", "UBER", "SOFI", "RIVN", "GME", "SNOW",
-           "SHOP", "DIS", "NIO", "F", "GLD", "SLV", "TLT", "XLF", "XLE", "ARKK", "SOXL", "TQQQ"]
+           "SHOP", "DIS", "NIO", "F", "GLD", "SLV", "TLT", "XLF", "XLE", "ARKK"] + list(LEVERAGED)
 
 
 def list_products(quote="USD", symbols=None):
@@ -6093,7 +6174,8 @@ def list_products(quote="USD", symbols=None):
                 px = float((sn.get("latestTrade") or {}).get("p") or (sn.get("dailyBar") or {}).get("c") or 0)
                 prev = float((sn.get("prevDailyBar") or {}).get("c") or 0)
                 vol = float((sn.get("dailyBar") or {}).get("v") or 0)
-                out.append(dict(coin=sym, price=px, change_24h=(px / prev - 1) * 100 if prev else None, volume_usd=vol * px))
+                out.append(dict(coin=sym, price=px, change_24h=(px / prev - 1) * 100 if prev else None, volume_usd=vol * px,
+                                kind=kind_text(sym)))
             except (TypeError, ValueError, AttributeError):
                 continue
     return sorted(out, key=lambda r: -(r["volume_usd"] or 0))
@@ -6126,6 +6208,7 @@ def scout_score(d, trade_size=None):
 def scout_coins(products, n, min_volume=5_000_000, trade_size=None, why=None):
     """The bot's own ticker pick for a new session: the best by scout_score, with one place kept for the best index
     ETF (SPY, QQQ, IWM, DIA) when picking 3 or more, so the farm always has a steady, liquid market to learn on.
+    Leveraged and inverse ETFs move several times more, so they'd win every pick: at most half the picks are those.
     why (a dict) gets each pick's reason."""
     pool = [d for d in products if d["coin"] not in STABLES and (d["volume_usd"] or 0) >= min_volume
             and d["change_24h"] is not None]
@@ -6133,9 +6216,19 @@ def scout_coins(products, n, min_volume=5_000_000, trade_size=None, why=None):
     for d in pool:
         sc, w = scout_score(d, trade_size)
         if sc > 0:
+            if d["coin"] in LEVERAGED:
+                w += f", {kind_text(d['coin'])}"
             scored.append((sc, d["coin"], w))
     scored.sort(reverse=True)
-    picks = [c for _, c, _ in scored[:n]]
+    picks, lev = [], 0
+    for _, c, _ in scored:
+        if len(picks) >= n:
+            break
+        if c in LEVERAGED:
+            if lev >= max(1, n // 2) if n >= 2 else True:
+                continue
+            lev += 1
+        picks.append(c)
     if n >= 3 and not any(c in INDEX_ETFS for c in picks):
         etf = next(((sc, c) for sc, c, _ in scored if c in INDEX_ETFS), None)
         if etf:
