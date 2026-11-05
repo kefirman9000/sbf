@@ -65,6 +65,7 @@ import broker as B
 
 # ---- Update settings: change to your GitHub "user/repo" after publishing ----
 UPDATE_REPO = "kefirman9000/sbf"
+DONATE_URL = "https://github.com/sponsors/kefirman9000"  # the Donate button (top right)
 HERE = os.path.dirname(os.path.abspath(__file__))
 APP_SHORT = "SBF"
 CONFIG_PATH = os.path.join(E.HOME_DIR, "config.json")
@@ -1368,10 +1369,16 @@ class App:
         self.kill_btn.pack(side="left", padx=(6, 0))
         Tip(self.kill_btn, "Kill switch: stops the bot, cancels waiting orders, sells everything at market and locks LIVE "
                            "mode until you unlock it.")
+        self.donate_btn = tk.Button(header, text="\u2665 Donate", command=lambda: webbrowser.open(DONATE_URL),
+                                    relief="flat", bd=0, bg="#db2777", fg="white", activebackground="#be185d",
+                                    activeforeground="white", padx=12, pady=3, cursor="hand2", font=("", 9, "bold"))
+        self.donate_btn.pack(side="right", padx=(0, 14))  # packed first, so it sits in the top-right corner
+        Tip(self.donate_btn, "SBF is free and made in spare time. Donations (GitHub Sponsors) pay for new breeds, new "
+                             "tricks and more time to build them. Opens in your browser.")
         self.theme_btn = tk.Button(header, text="Light mode" if DARK else "Dark mode", command=lambda: self.set_dark(not DARK),
                                    relief="flat", bd=0, bg=LINE, fg=TEXT, activebackground=LINE, activeforeground=TEXT,
                                    padx=10, pady=3, cursor="hand2")
-        self.theme_btn.pack(side="right", padx=(0, 14))
+        self.theme_btn.pack(side="right", padx=(0, 8))
         self.mute_btn = tk.Button(header, text="\u266a off" if self.cfg.get("muted") else "\u266a", command=self.toggle_mute,
                                   relief="flat", bd=0, bg=CARD, fg=TEXT, activebackground=CARD, cursor="hand2", font=("", 11))
         self.mute_btn.pack(side="right", padx=(0, 8))
@@ -1824,6 +1831,7 @@ class App:
         m.add_command(label="Install add-ons (setup)...", command=self.open_setup)
         m.add_separator()
         m.add_command(label="Check for updates", command=self.check_update)
+        m.add_command(label="Donate (GitHub Sponsors)...", command=lambda: webbrowser.open(DONATE_URL))
         m.add_command(label="Undo last update", command=self.undo_update)
         bar.add_cascade(label="Tools", menu=m)
         m = tk.Menu(bar, tearoff=0)
@@ -3726,6 +3734,16 @@ class App:
                     self._restored_farm = t
         if self.session and self.live and not self.client:
             return messagebox.showerror("Live mode", "Log in to Alpaca first.")
+        if (not self.client and not self.logging_in and not E.ALPACA.get("key") and not self.tray_mode
+                and not self.in_bg() and E.load_login() is None):
+            ans = messagebox.askyesnocancel(
+                "Log in for prices", "Practice trades pretend money, but the prices come from Alpaca, so the bots need "
+                "a login before they can do anything. A free Alpaca paper key is enough.\n\nYes = log in now\n"
+                "No = start anyway (the bots wait until you log in)\nCancel = don't start")
+            if ans is None:
+                return
+            if ans:
+                return self.open_login()
         self.running = True
         self.cfg.update(was_running=True, last_mode="live" if self.live else "paper", last_tag=self.sess_tag(),
                         last_wild=bool(self.wild_var.get()))
@@ -6391,6 +6409,14 @@ class App:
                     t = self.tourn
                     if not self.cfg.get("roam_on") or t is None or not self.session_coins:
                         continue
+                    if not E.ALPACA.get("key"):  # history comes from Alpaca: wait for a login instead of failing
+                        if not getattr(self, "_roam_login_note", False):
+                            self._roam_login_note = True
+                            self.q.put(("log", ("Free roam is waiting for you to log in to Alpaca (Account > Log in, a "
+                                                "free paper key is enough): it studies history from there.", "warn")))
+                        self.roam_err = (time.time(), "waiting for an Alpaca login (Account > Log in)")
+                        continue
+                    self._roam_login_note = False
                     wait = self.roam_wait()
                     if time.time() - getattr(self, "_roam_last", 0) < wait:
                         continue
@@ -6409,6 +6435,13 @@ class App:
                     self._roam_last = time.time()
                 except E.TrainingStopped:  # the farm changed (reset, new session): just move on
                     self.roam_now = None
+                except E.NeedLogin:  # logged out in the middle of a study: not a crash, just wait for the login
+                    self.roam_now = None
+                    self.roam_err = (time.time(), "waiting for an Alpaca login (Account > Log in)")
+                except E.NoHistory as e:  # nothing to study there (a holiday, a gap in the data): not a crash
+                    self.roam_now = None
+                    self.roam_err = (time.time(), str(e))
+                    self._roam_last = time.time() - max(0, self.roam_wait() - 60)
                 except Exception as e:
                     self.roam_now = None
                     msg = str(e) or e.__class__.__name__

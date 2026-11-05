@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.1
+- **Donate button**: a pink **Donate** button in the top right (and Tools > Donate) opens SBF's GitHub Sponsors page.
+  SBF stays free; donations pay for new breeds, new tricks and more time to build them.
+- **Fix: Free roam no longer logs errors when you aren't logged in.** It needs Alpaca's history, so it now waits
+  quietly, says once in the log that it's waiting for a login, and starts studying as soon as you log in.
+- **Start asks you to log in when you haven't**: Practice uses pretend money but real prices, and those come from
+  Alpaca, so without a login the bots just waited. Start now offers to open the login (or start anyway).
+- **Fix: "no history" isn't a crash any more.** When Free roam finds nothing to study (a holiday, a gap in the
+  data) it notes it and moves on, instead of adding an entry to crash.log and the error counter.
+- **New README and screenshots**: the page now explains how the farm trains, breeds and tests its dragons, with
+  fresh dark-mode screenshots of the farm, the BEASTS den, Overview, a dragon's card, Free roam, Farm knowledge, the Library,
+  Portfolio, Bot positions and Success.
+
 ## 1.0.0
 - **SBF, the Stock Bot Farm: the farm from OBF and CBBF, trading shares.** Built from OBF 1.24.0 (the options farm),
   with its learning, breeding, Free roam, exams, Library and Hall of Fame. The bots and your account buy and sell
