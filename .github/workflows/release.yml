@@ -29,7 +29,7 @@ jobs:
         run: |
           V=${{ steps.v.outputs.version }}
           mkdir -p dist/SBF
-          cp main.py engine.py broker.py icon_data.py tray.py VERSION README.md CHANGELOG.md requirements.txt "Run SBF.bat" SBF.pyw dist/SBF/
+          cp main.py engine.py farmcore.py broker.py icon_data.py tray.py VERSION README.md CHANGELOG.md requirements.txt "Run SBF.bat" SBF.pyw dist/SBF/
           (cd dist && zip -qr "SBF-$V.zip" SBF)
           # the app checks every download against this before installing it
           (cd dist && sha256sum "SBF-$V.zip" > "SBF-$V.zip.sha256")

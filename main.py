@@ -148,6 +148,10 @@ SETTING_GROUPS = [
                           "at once. Stops one bad dragon draining the account. Example: 25 with $1,000 = $250 per bot (0 = no limit)", float),
     ]),
     ("Wildcard", "How the bot treats strategies that are winning, shaky or failing.", [
+        ("auto_exams", "Exams with Free roam off: every 20 minutes, up to 3 bots that still need exams are tested on history "
+                       "they never trained on (they learn nothing from it; it only records how they did)", bool),
+        ("keep_variety", "Keep backup strategies: when one strategy fills over half the farm, half the new eggs try other "
+                         "strategies, and the last two of any strategy are dropped last", bool),
         ("keep_veterans", "Keep proven veterans: a bot with 8+ finished trades that made money over its life and beat just "
                           "holding survives a bad patch (it's benched, not retired) until its lifetime record turns", bool),
         ("proven_only", "Only proven bots trade the account (practice, Alpaca paper and LIVE): a bot needs a real track "
@@ -816,6 +820,7 @@ class App:
         root.after(4000, self.auto_check_update)
         root.after(1200, self.restore_last_session)
         root.after(90000, self.hourly)  # weekly backup, daily recap
+        root.after(10 * 60 * 1000, self.exam_pass)  # exams for bots that need them, even with Free roam off
         root.after(120000 if self.tray_mode else 2500, self.tray_autotrain if self.tray_mode else self.auto_resume)  # tray: let Windows finish starting first
         self.fit_and_center()
         if self.tray_mode:
@@ -1047,9 +1052,95 @@ class App:
         except Exception:
             E.note_error("on_shutdown")
 
+    LIQUID = ("SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN", "TSLA", "META", "AMD")
+
+    def thin_check(self):
+        """Once a day: a ticker that went without trades in a fifth or more of its recent bars is a thin market. Its
+        prices jump between few trades, which fools the bots and fills badly; suggest well-traded replacements."""
+        if not (self.running and self.session_coins) or time.time() - float(self.cfg.get("thin_check_t", 0) or 0) < 86400:
+            return
+        thin = []
+        for c in self.session_coins:
+            px = list(self.hist.get(c) or [])[-1441:]
+            vol = list((self.hx.get(c) or {}).get("v") or [])[-1440:]
+            if len(px) < 300:
+                continue
+            n = len(px) - 1
+            vol = [None] * (n - len(vol)) + vol[-n:]
+            # a bar with no trades: no volume, or not even a tick of price movement
+            share = sum(1 for i in range(1, len(px)) if px[i] == px[i - 1] or (vol[i - 1] is not None and vol[i - 1] <= 0)) / n
+            if share >= 0.2:
+                thin.append((c, share))
+        if not thin:
+            return
+        self.cfg["thin_check_t"] = time.time()
+        try:
+            E.save_json(CONFIG_PATH, self.cfg)
+        except OSError:
+            pass
+        alt = [x for x in self.LIQUID if x not in self.session_coins][:4]
+        what = ", ".join(f"{c} (no trades in {sh * 100:.0f}% of its recent bars)" for c, sh in thin)
+        msg = (f"Thin market: {what}. Prices jump between few trades there, which fools the bots and fills badly. "
+               f"Well-traded tickers to consider instead: {', '.join(alt)}.")
+        self.write(msg, "warn")
+        if self.tray is not None:
+            self.tray.notify(msg[:250], "Thin market")
+
+    def exam_pass(self):
+        """Every 20 minutes while the farm runs and Free roam is OFF: up to 3 bots that still need exams are tested on
+        a stretch of history none of them trained on, at their own candle size. It's only an exam: the bots learn
+        nothing from it (Free roam does the learning), it only records how they did on unseen prices. A stretch is
+        downloaded once and kept on disk; without a connection it simply waits for the next round."""
+        self.root.after(20 * 60 * 1000, self.exam_pass)
+        t = self.tourn
+        if (not self.settings.get("auto_exams", True) or self.cfg.get("roam_on") or getattr(self, "_exam_busy", False)
+                or not (self.running and self.wild and t and self.seeded)):
+            return
+        ranked = [v for v, _ in t.ranking()]
+        need = [v for v in list(dict.fromkeys(list(t.active) + ranked[:25]))
+                if not E.is_kami(v) and E.exam_verdict(v, t.serial)[0] == "untested"]
+        picks = need[:3]
+        if not picks:
+            return
+        self._exam_busy = True
+        fee, slip = E.cost_model(self.settings)
+        pct, cash, gran = self.settings["trade_pct"] / 100, self.start_cash, self.farm_gran()
+        names = [E.bot_nickname(v.key()) for v in picks]
+
+        def work():
+            import random as _r
+            self._exam_thread = threading.get_ident()
+            try:
+                closes, extra, info = self._roam_pick(_r.Random(), prefer=gran)
+                if info.get("revisit") or info.get("gran") != gran:
+                    return  # only first visits at their own candle size count as exams
+                out = [(v, E.backtest_bot(v, closes, extra, cash, fee, pct, slip)) for v in picks]
+
+                def apply():
+                    if self.tourn is not t:
+                        return
+                    done = []
+                    for (v, r), nm in zip(out, names):
+                        if v in t.vars:
+                            E.add_exam(v, "self-test", r["edge"] * 100, r.get("closed", r["trades"]), info["start"], info["gran"])
+                            done.append(f"{nm} {r['edge'] * 100:+.1f}% vs holding")
+                    if done:
+                        t._rate()
+                        self.write("Exams on prices they never saw (" + self._when(info["start"], True) + "): "
+                                   + ", ".join(done) + ".")
+                self.q.put(("call", apply))
+            except Exception:
+                pass  # offline, no stretch with history, or the farm changed: try again next round
+            finally:
+                self._exam_thread = None
+                self._exam_busy = False
+                if not self.cfg.get("roam_on"):
+                    self.roam_now = None
+        threading.Thread(target=work, daemon=True, name="exam pass").start()
+
     def hourly(self):
         """Light housekeeping once an hour: the weekly backup, the daily recap, and (in the background) the update check."""
-        for fn in (self.auto_backup, self.daily_recap):
+        for fn in (self.auto_backup, self.daily_recap, self.thin_check):
             try:
                 fn()
             except Exception:
@@ -6501,6 +6592,10 @@ class App:
 
     def roam_check_on(self, t=None):
         """Stops the study in progress as soon as Free roam is switched off (or the farm changes)."""
+        if threading.get_ident() == getattr(self, "_exam_thread", None):  # the exam pass runs with Free roam off
+            if t is not None and self.tourn is not t:
+                raise E.TrainingStopped()
+            return
         if not self.cfg.get("roam_on") or (t is not None and self.tourn is not t):
             raise E.TrainingStopped()
 

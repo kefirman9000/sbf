@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.2.0
+- **Exams with Free roam off**: most bots were never examined, because exams only happened inside Free roam. Now,
+  every 20 minutes while the farm runs, up to 3 bots that still need exams are tested on a stretch of history none of
+  them trained on, at their own candle size. It's only an exam: the bots learn nothing from it. Each stretch downloads
+  once and is kept; with no connection it waits for the next round. Settings > "Exams with Free roam off".
+- **Backup strategies stay alive**: when one strategy fills over half the farm, half the new eggs try other
+  strategies, and the last two bots of any strategy are dropped last. If the market stops suiting the favourite, there
+  are alternatives ready. Settings > "Keep backup strategies".
+- **Thin-market warning**: once a day, a ticker that went without trades in a fifth or more of its recent bars gets a
+  warning in the log (and on the icon), with well-traded tickers to consider instead.
+- **Shared core**: about 800 lines that were identical in CBBF, OBF and SBF now live in one shared file, farmcore.py,
+  so fixes to that code reach all three apps at once. tools/sync_core.py copies it between the apps, and a test fails
+  if one app's copy drifts.
+
 ## 1.1.1
 - **Successful bots stay.** A bot with 8+ finished trades that made money over its whole life and beat just holding
   is now protected from retirement and from being dropped to make room. A bad patch benches it (no say in trades)
