@@ -148,6 +148,8 @@ SETTING_GROUPS = [
                           "at once. Stops one bad dragon draining the account. Example: 25 with $1,000 = $250 per bot (0 = no limit)", float),
     ]),
     ("Wildcard", "How the bot treats strategies that are winning, shaky or failing.", [
+        ("keep_veterans", "Keep proven veterans: a bot with 8+ finished trades that made money over its life and beat just "
+                          "holding survives a bad patch (it's benched, not retired) until its lifetime record turns", bool),
         ("proven_only", "Only proven bots trade the account (practice, Alpaca paper and LIVE): a bot needs a real track "
                         "record first. Every other bot keeps training on its own pretend money", bool),
         ("proven_trades", "...finished trades a bot needs before it may trade the account", int),
@@ -1062,7 +1064,7 @@ class App:
     def recap_base(self):
         beasts = sum(1 for r in self.tourn.board() if self.tier(r) == "beast") if self.tourn else 0
         return dict(day=date.today().isoformat(), eq=self.equity(), hold=self.bench_equity(), beasts=beasts,
-                    live=bool(self.live))
+                    live=bool(self.live), sid=[float(self.start_cash), sorted(self.session_coins)])
 
     def daily_recap(self):
         """Once a day: how the bots did yesterday against the market (a note on the icon, and in the log)."""
@@ -1072,7 +1074,11 @@ class App:
         today = date.today().isoformat()
         if isinstance(base, dict) and base.get("day") == today and base.get("live") == bool(self.live):
             return
+        if not self.last_tick or (datetime.now() - self.last_tick).total_seconds() > 600:
+            return  # no fresh prices (not logged in, offline, market closed): values would be wrong, try later
         now = self.recap_base()
+        if isinstance(base, dict) and base.get("sid") != now["sid"]:
+            base = None  # a different session since (reset, new money or coins): start a fresh recap from here
         if isinstance(base, dict) and base.get("live") == bool(self.live) and base.get("eq"):
             got = (now["eq"] / base["eq"] - 1) * 100
             hold = (now["hold"] / base["hold"] - 1) * 100 if base.get("hold") else 0.0
@@ -4947,6 +4953,7 @@ class App:
             if self.running:
                 self.on_backfill(*data)
         elif kind == "connected":
+            self._login_tries = 0
             self.client, self.balances = data
             self.usd_avail = self.avail()
             self.logging_in = False
@@ -4973,6 +4980,15 @@ class App:
                                        "have been regenerated or revoked), so it was forgotten.\n\nPlease log in with "
                                        "your current key and tick 'Remember'. Until then the bots have no prices.")
                 self.open_login()
+        elif kind == "saved_login_retry":
+            self.logging_in = False
+            self.update_status()
+            n = self._login_tries = getattr(self, "_login_tries", 0) + 1
+            wait = min(600, 30 * 2 ** (n - 1))  # 30 s, 1, 2, 4, 8 min, then every 10 min
+            self.write(f"Couldn't reach Alpaca yet ({data}). Trying the saved login again in "
+                       f"{wait // 60} min." if wait >= 60 else
+                       f"Couldn't reach Alpaca yet ({data}). Trying the saved login again in {wait} seconds.", "warn")
+            self.root.after(wait * 1000, self.auto_login)
         elif kind == "login_failed":
             self.logging_in = False
             self.update_status()
@@ -9501,6 +9517,8 @@ class App:
             if saved and ("401" in low or "403" in low or "unauthorized" in low or "forbidden" in low):
                 E.clear_login()  # a dead key: forget it, so the next start doesn't fail the same way
                 return self.q.put(("saved_login_rejected", E.explain_login_error(e, secret)))
+            if saved:  # no answer yet (often right after the computer starts): try again shortly
+                return self.q.put(("saved_login_retry", E.explain_login_error(e, secret)))
             return self.q.put(("login_failed", E.explain_login_error(e, secret)))
         E.ALPACA.update(creds)
         if remember and not E.save_login(key, secret, paper):
@@ -12174,6 +12192,11 @@ class App:
                 if lab["bars"] % 10 == 0:
                     self.lab_save()
             except Exception as e:
+                if isinstance(e, E.NeedLogin) or getattr(e, "code", None) in (401, 403):
+                    # not logged in (or the key isn't accepted): nothing to record, just wait for a login
+                    lab["status"] = "Waiting for an Alpaca login (Account > Log in)."
+                    time.sleep(300)
+                    continue
                 lab["status"] = f"The lab hit a problem and tries again in a minute: {str(e)[:120]}"
                 self._record_error("scalp lab")
                 time.sleep(55)

@@ -1845,6 +1845,7 @@ DEFAULT_SETTINGS = {
     "roam_reuse": 3,             # Free roam studies each downloaded stretch this many times before fetching a new one
     "feature_tests": True,       # Free roam tests what each learning switch is worth (reported, never changed for you)
     "report_detail": False,      # Export a report also adds the detailed part (bot trades, price feed, checks)
+    "keep_veterans": True,       # bots with a winning lifetime record survive a bad patch (benched, not retired)
     "proven_only": True,         # only bots with a real track record decide the account's trades
     "proven_trades": 8,          # ...finished trades a bot needs first
     "proven_exam": True,         # ...and passed exams on prices it never trained on
@@ -2497,7 +2498,7 @@ def tournament_opts(settings):
                 post_review=bool(settings.get("post_review", True)), learn_losses=bool(settings.get("learn_losses", True)),
                 time_habits=bool(settings.get("time_habits", True)), agree_sizing=bool(settings.get("agree_sizing", True)), islands=max(1, min(6, int(settings.get("islands", 3) or 1))),
                 adapt_exits=bool(settings.get("adapt_exits", True)), mut_memory=bool(settings.get("mut_memory", True)),
-                proven_only=bool(settings.get("proven_only", True)), proven_exam=bool(settings.get("proven_exam", True)),
+                proven_only=bool(settings.get("proven_only", True)), keep_veterans=bool(settings.get("keep_veterans", True)), proven_exam=bool(settings.get("proven_exam", True)),
                 proven_trades=int(settings.get("proven_trades", 8) or 0),
                 prem=list(PREM_RANGE), cfee=CONTRACT_FEE[0], sspread=_set_scalp_spread(settings))
 
@@ -3811,6 +3812,7 @@ class Tournament:
         k = best[1]
         spec = VETOES[k]
         v.vetoes = clean_vetoes(dict(v.vetoes, **{k: (spec["lo"] + spec["hi"]) / 2}))
+        v.__dict__.pop("_key", None)  # its genes changed: its identity (cached at birth) must be worked out again
         v.own_review.pop(k, None)
         if k in v.vetoes:
             v.mut_kinds = list(v.mut_kinds) + ["self_review"]
@@ -4444,6 +4446,18 @@ class Tournament:
             c = [(self.contender(v), v) for v in self.vars]
             c = sorted(((x, v) for x, v in c if x is not None), key=lambda xv: -xv[0])
             out = {id(v) for _, v in c[:max(1, self.cap // 3)]}
+        if self.o.get("keep_veterans", True):
+            # proven veterans: 8+ finished trades, money made over their whole life and more than just holding. A bad
+            # patch benches them (no say in trades) but doesn't kill them; they only go once their lifetime record does.
+            vet = []
+            for v in self.vars:
+                if id(v) in out or is_kami(v) or (v.wins + v.losses) < 8:
+                    continue
+                lf = self.life(v)
+                if lf["ret"] > 0 and lf["edge"] is not None and lf["edge"] > 0:
+                    vet.append((lf["edge"], v))
+            vet.sort(key=lambda x: -x[0])
+            out = out | {id(v) for _, v in vet[:max(1, self.cap // 6)]}
         self._prot_key, self._prot = key, out
         return out
 
@@ -4679,7 +4693,28 @@ class Tournament:
         r = self.instincts.get(name)
         return bool(r and r[1] >= INSTINCT_PROVEN and r[0] > 0)
 
+    def drop_twins(self):
+        """Exact copies on the same island (identical settings, rules and layers, from migration, training camps or
+        starter sets) waste farm places and vote twice for the same idea. The best-scoring copy stays."""
+        groups = {}
+        for v in self.vars:
+            groups.setdefault((getattr(v, "island", 0), v.key()), []).append(v)
+        gone = 0
+        for vs in groups.values():
+            if len(vs) < 2:
+                continue
+            vs.sort(key=lambda x: (self.score(x) is not None, self.score(x) or 0.0, -x.uid), reverse=True)
+            for v in vs[1:]:
+                if v in self.vars:
+                    self._remove(v, "exact copy of another bot")
+                    gone += 1
+        if gone:
+            self.events.append(f"Removed {gone} exact cop{'y' if gone == 1 else 'ies'} of other bots (the best copy stays)")
+        return gone
+
     def evolve(self, closes):
+        if self.drop_twins():
+            self._rate()
         self.instinct_tick()
         for v in self.vars:  # strikes: checks spent benched (slowed counts half, standby none)
             st = self.info[id(v)]["status"]

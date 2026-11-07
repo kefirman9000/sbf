@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.1.1
+- **Successful bots stay.** A bot with 8+ finished trades that made money over its whole life and beat just holding
+  is now protected from retirement and from being dropped to make room. A bad patch benches it (no say in trades)
+  but no longer kills it; it only goes once its lifetime record turns. Weaker bots still die out as before.
+  Settings > "Keep proven veterans".
+- **No more exact copies.** Copies of the same bot on the same island (from migration, training camps or starter
+  sets) wasted farm places and voted twice for the same idea. The best-scoring copy stays, the rest are removed.
+- Fixed: a bot that learned a rule from its own losses kept its old identity, so the copy check and the Hall of Fame
+  could mix it up with its parent.
+- **Daily recap fixed**: it no longer reports gains while prices are stale or across a reset (it once showed
+  +83% for a day with no trades). It waits for fresh prices and starts over when the session changes.
+- **Background start logs in reliably.** When the computer had just started, the saved Alpaca login could time out
+  and was never tried again, so the bots trained all day without prices. It now retries after 30 seconds, then 1, 2,
+  4 and 8 minutes, then every 10 minutes, and loads the missed history once it connects.
+- The scalp lab no longer fills the error log every minute while logged out; it waits quietly for a login.
+
 ## 1.1.0
 - **Proven bots are reachable now.** Almost no bot ever earned a vote, so the account never traded. Two reasons:
   bots were replaced faster than they could finish a record (about half the farm in two hours), and trades from Free
