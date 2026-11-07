@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.1
+- **Essentials only button** (top bar, next to Check for updates): one click switches off everything that downloads
+  extra history or works the disk in the background: Free roam, the Slow farm, the Scalp lab, background exams, the automatic
+  economic calendar refresh and weekly backups. Normal trading and its prices keep running. While it's on, those modes
+  can't start by themselves; starting one by hand asks whether to switch Essentials only off. Click again to allow them.
+
 ## 1.2.0
 - **Exams with Free roam off**: most bots were never examined, because exams only happened inside Free roam. Now,
   every 20 minutes while the farm runs, up to 3 bots that still need exams are tested on a stretch of history none of

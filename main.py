@@ -1086,6 +1086,48 @@ class App:
         if self.tray is not None:
             self.tray.notify(msg[:250], "Thin market")
 
+    def essentials_block(self, what):
+        """True if Essentials only is on and stays on (asks first); False if it's off or you switch it off."""
+        if not self.cfg.get("essentials"):
+            return False
+        if messagebox.askyesno("Essentials only is on", f"{what} downloads extra history and works the disk in the "
+                               "background, so Essentials only keeps it off.\n\nSwitch Essentials only off and start it?"):
+            self.toggle_essentials(False)
+            return False
+        return True
+
+    def toggle_essentials(self, on=None):
+        on = (not self.cfg.get("essentials")) if on is None else bool(on)
+        self.cfg["essentials"] = on
+        E.save_json(CONFIG_PATH, self.cfg)
+        if on:
+            stopped = []
+            if self.cfg.get("roam_on"):
+                self.toggle_roam(False)
+                stopped.append("Free roam")
+            if self.cfg.get("slow_on") and hasattr(self, "slow_toggle"):
+                self.slow_toggle()
+                stopped.append("the Slow farm (it keeps what it learned)")
+            if self.cfg.get("lab_on"):
+                self.toggle_lab()
+                stopped.append("the Scalp lab")
+            self.write("Essentials only ON: only normal trading and its prices run. "
+                       + (f"Stopped {', '.join(stopped)}. " if stopped else "")
+                       + "Background exams, the economic calendar refresh and weekly backups are paused too. "
+                       "Press the button again to allow them.", "good")
+        else:
+            self.write("Essentials only OFF: Free roam, the Slow farm and the other extras can run again (each still "
+                       "only runs when you switch it on; background exams and weekly backups resume by themselves).")
+        self.paint_essentials()
+
+    def paint_essentials(self):
+        if not hasattr(self, "ess_btn"):
+            return
+        on = bool(self.cfg.get("essentials"))
+        self.ess_btn.config(text="\u25cf Essentials only: ON" if on else "\u25cb Essentials only",
+                            bg=GREEN if on else LINE, fg="#0b1220" if on else TEXT,
+                            activebackground=GREEN if on else LINE, activeforeground="#0b1220" if on else TEXT)
+
     def exam_pass(self):
         """Every 20 minutes while the farm runs and Free roam is OFF: up to 3 bots that still need exams are tested on
         a stretch of history none of them trained on, at their own candle size. It's only an exam: the bots learn
@@ -1093,7 +1135,8 @@ class App:
         downloaded once and kept on disk; without a connection it simply waits for the next round."""
         self.root.after(20 * 60 * 1000, self.exam_pass)
         t = self.tourn
-        if (not self.settings.get("auto_exams", True) or self.cfg.get("roam_on") or getattr(self, "_exam_busy", False)
+        if (not self.settings.get("auto_exams", True) or self.cfg.get("roam_on") or self.cfg.get("essentials")
+                or getattr(self, "_exam_busy", False)
                 or not (self.running and self.wild and t and self.seeded)):
             return
         ranked = [v for v, _ in t.ranking()]
@@ -1486,6 +1529,13 @@ class App:
                                  bg=LINE, fg=TEXT, activebackground=LINE, activeforeground=TEXT, padx=10, pady=3,
                                  cursor="hand2", font=("", 9, "bold"))
         self.upd_btn.pack(side="right", padx=(0, 8))
+        self.ess_btn = tk.Button(header, command=self.toggle_essentials, relief="flat", bd=0, padx=10, pady=3,
+                                 cursor="hand2", font=("", 9, "bold"))
+        self.ess_btn.pack(side="right", padx=(0, 8))
+        Tip(self.ess_btn, "Essentials only: switches off everything that downloads extra history or works the disk in "
+                          "the background (Free roam, the Slow farm, the Scalp lab, background exams, the economic "
+                          "calendar refresh, weekly backups). Normal trading and its prices keep running.")
+        self.paint_essentials()
         Tip(self.upd_btn, f"You have version {self.version}. Checks GitHub for a newer one; nothing installs until you accept.")
         self.conn_lbl = tk.Label(header, text="Not logged in", bg=CARD, fg=MUTED)
         self.conn_lbl.pack(side="right", padx=14)
@@ -2026,6 +2076,7 @@ class App:
         E.save_json(CONFIG_PATH, self.cfg)
         self.dark_var.set(dark)
         self.theme_btn.config(text="Light mode" if dark else "Dark mode")
+        self.paint_essentials()
         self.update_status()
         self.refresh_view()
         self.refresh_trades()
@@ -7068,6 +7119,8 @@ class App:
 
     def toggle_roam(self, on=None):
         on = (not self.cfg.get("roam_on")) if on is None else on
+        if on and self.essentials_block("Free roam"):
+            return
         self.cfg["roam_on"] = bool(on)
         E.save_json(CONFIG_PATH, self.cfg)
         self._roam_last = 0
@@ -7646,6 +7699,8 @@ class App:
 
     def slow_start(self, quiet=False):
         """Loads (or hatches and warms up) the slow farm, then follows each new hourly candle."""
+        if self.cfg.get("essentials") and (quiet or self.essentials_block("The Slow farm")):
+            return
         sl = self.slow
         self.cfg["slow_on"] = True
         E.save_json(CONFIG_PATH, self.cfg)
@@ -8256,7 +8311,7 @@ class App:
     def auto_backup(self):
         """Once a week: a copy of the bots, farms, sessions and settings in auto-backups/ (the last 4 are kept).
         Price history is left out (it downloads again by itself), so each copy stays small."""
-        if not self.settings.get("auto_backup", True):
+        if not self.settings.get("auto_backup", True) or self.cfg.get("essentials"):
             return
         if time.time() - float(self.cfg.get("last_auto_backup", 0) or 0) < 7 * 86400:
             return
@@ -8670,6 +8725,8 @@ class App:
         self.root.after(15 * 60 * 1000, self.news_card_refresh)
 
     def fetch_calendar(self, key=None, done=None, quiet=False):
+        if quiet and self.cfg.get("essentials"):
+            return  # the automatic weekly refresh is an extra download
         key = (key or self.cfg.get("fred_key") or "").strip()
         if not key:
             if done:
@@ -12120,6 +12177,8 @@ class App:
 
     def toggle_lab(self):
         on = not self.cfg.get("lab_on", False)
+        if on and self.essentials_block("The Scalp lab"):
+            return
         self.cfg["lab_on"] = on
         E.save_json(CONFIG_PATH, self.cfg)
         self.write("\u26a1 Scalp lab ON: scalpers learn on their own from live prices while the market is open." if on else
