@@ -6203,7 +6203,13 @@ class App:
                    "decisions (mostly on your farm's own candle size, so its graduates fit your farm).")
         auto_var = tk.BooleanVar(value=False)
         auto_cb = ttk.Checkbutton(row, text="Auto", variable=auto_var)
-        auto_cb.pack(side="left", padx=(0, 6))
+        auto_cb.pack(side="left", padx=(0, 4))
+        ttk.Label(row, text="wait").pack(side="left")
+        wait_var = tk.StringVar(value=str(self.cfg.get("tc_wait", 10)))
+        wait_cb = ttk.Combobox(row, textvariable=wait_var, values=["0", "5", "10", "30", "60"], width=3, state="readonly")
+        wait_cb.pack(side="left", padx=(2, 2))
+        ttk.Label(row, text="s").pack(side="left", padx=(0, 6))
+        Tip(wait_cb, "Seconds Auto waits between camps (a breather for the app). Stop cancels the next camp while it waits.")
         Tip(auto_cb, "Auto: runs one Training camp after another with random settings (under Max decisions). After each "
                      "run your farm learns from it and the bots that passed the exam join your farm. Runs while this "
                      "window is open; Stop or untick to end it. Essentials only keeps it off.")
@@ -6406,7 +6412,19 @@ class App:
                                            trades=r["trades"], segments_passed=int(bool(r["passed"])), segments=1)]
             self.catch_rows(entries, "training camp")
         go.config(command=run)
-        stop_b.config(command=lambda: (st.__setitem__("stop", True), auto_var.set(False), status.config(text="Stopping...")))
+        def stop_all():
+            auto_var.set(False)
+            aid = st.pop("after", None)
+            if aid:  # waiting for the next camp: cancel it
+                try:
+                    w.after_cancel(aid)
+                except Exception:
+                    pass
+                stop_b.config(state="disabled")
+                return status.config(text="Auto stopped.")
+            st["stop"] = True
+            status.config(text="Stopping...")
+        stop_b.config(command=stop_all)
 
         def randomize():
             import random as _r
@@ -6465,19 +6483,36 @@ class App:
             self.write("\u2694 Auto training camp: your farm learned from it" +
                        (f", and {n} bot{'s' if n != 1 else ''} that passed joined your farm." if n else "."), "good")
 
-        def auto_next(delay=30):
+        def auto_next(delay=None):
             if not (auto_var.get() and w.winfo_exists()):
                 return
             if self.cfg.get("essentials"):
                 auto_var.set(False)
                 return status.config(text="Auto stopped: Essentials only is on.")
-            status.config(text=f"Auto: next camp in {delay} seconds...")
+            if delay is None:
+                try:
+                    delay = max(0, min(600, int(wait_var.get())))
+                except ValueError:
+                    delay = 10
+                self.cfg["tc_wait"] = delay
+            stop_b.config(state="normal")  # Stop works while it waits, too
 
-            def go_again():
-                if auto_var.get() and w.winfo_exists() and str(go.cget("state")) != "disabled":
+            def tick(left):
+                st.pop("after", None)
+                if not w.winfo_exists():
+                    return
+                if not auto_var.get():  # Auto was unticked while waiting
+                    if str(go.cget("state")) != "disabled":
+                        stop_b.config(state="disabled")
+                    return status.config(text="Auto stopped.")
+                if left > 0:
+                    status.config(text=f"Auto: next camp in {left} second{'s' if left != 1 else ''} (Stop cancels it)")
+                    st["after"] = w.after(1000, lambda: tick(left - 1))
+                    return
+                if str(go.cget("state")) != "disabled":
                     randomize()
                     run()
-            w.after(delay * 1000, go_again)
+            tick(delay)
 
         def auto_toggled():
             if auto_var.get():

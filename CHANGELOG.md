@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.1
+- Training camp Auto: **Stop now works while it waits** between camps (it cancels the next one), the wait shows a
+  countdown, and a **wait** choice sets the pause between camps (0, 5, 10, 30 or 60 seconds; default 10). Unticking
+  Auto during the wait stops it too.
+
 ## 1.4.0
 - **Training camp: Randomize, Auto and Max decisions.**
   - **Max decisions** (default 5,000): the most farm decisions one run may take (candles x passes). Longer periods are
