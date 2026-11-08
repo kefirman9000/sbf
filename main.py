@@ -1229,8 +1229,9 @@ class App:
                     self.refresh_board()
             self.cfg["auto_camps"] = int(self.cfg.get("auto_camps", 0) or 0) + 1
             self.camp_status = ""
+            visit = " (a repeat visit: it only teaches)" if info.get("revisit") else ""
             self.write(f"\u2694 Auto camp: a practice farm lived through {self._when(info['start'], True)} to "
-                       f"{self._when(info['end'], True)} ({info['bars']:,} decisions); {len(passed)} passed the exam. "
+                       f"{self._when(info['end'], True)} ({info['bars']:,} decisions){visit}; {len(passed)} passed the exam. "
                        "Your farm learned its lessons" + (f", and {grad} joined your farm." if grad else "."))
             self.save_farm(force=True)
         self.q.put(("call", apply))
@@ -6677,12 +6678,8 @@ class App:
     def roam_path(self):
         return os.path.join(E.HOME_DIR, "free-roam.json")
 
-    def start_free_roam(self):
-        """Free roam: the farm goes back in time on its own, ONLY while Free roam is switched ON (nothing runs in the
-        background otherwise). Each study either backtests some of its own
-        bots on a stretch of history (anywhere back to 2016), or runs a small practice farm there; every lesson is saved."""
-        if getattr(self, "_roam_thread", None) and self._roam_thread.is_alive():
-            return
+    def load_roam_state(self):
+        """Free roam's saved study log and status (also needed by Auto camp and the exam pass)."""
         saved = E.load_json(self.roam_path(), {}) or {}
         self.roam_log = list(saved.get("log") or [])[-300:]
         self.roam_features = dict(saved.get("features") or {})  # learning switch -> [[with, without, when], ...]
@@ -6693,6 +6690,14 @@ class App:
         self.roam_err = None
         self.roam_feed = deque(maxlen=400)
         self.roam_trades = 0
+
+    def start_free_roam(self):
+        """Free roam: the farm goes back in time on its own, ONLY while Free roam is switched ON (nothing runs in the
+        background otherwise). Each study either backtests some of its own
+        bots on a stretch of history (anywhere back to 2016), or runs a small practice farm there; every lesson is saved."""
+        if getattr(self, "_roam_thread", None) and self._roam_thread.is_alive():
+            return
+        self.load_roam_state()
 
         def loop():
             k = 0
@@ -6778,6 +6783,8 @@ class App:
         """Where the next Free roam study looks. Each stretch it downloads is studied `roam_reuse` times (Settings >
         Learning, default 3) before a new one is fetched. Repeat visits come back with info["revisit"] True: they teach,
         but never promote anyone (see E.StretchPool)."""
+        if not hasattr(self, "roam_log"):  # (Auto camp or the exam pass can get here before Free roam ever started)
+            self.load_roam_state()
         try:
             reuse = max(1, min(10, int(self.settings.get("roam_reuse", 3) or 1)))
         except (TypeError, ValueError):

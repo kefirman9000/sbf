@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.1
+- Fixed: Auto camp's (or the exam pass's) first stretch after the app started could fail with "no attribute roam_log"
+  when Free roam hadn't loaded its study log yet; it then waited 5 minutes before trying again. The log now loads
+  whenever any of them needs it.
+- Auto camp says when a stretch is a repeat visit. Each stretch is studied 3 times (Settings > Learning > Free roam
+  reuse); repeat visits teach your farm, but only a first visit can bring an exam-passing bot over.
+
 ## 1.3.0
 - **Auto camp** (the farm toolbar, next to Free roam): while your farm runs, it keeps picking stretches of past prices
   by itself and runs a practice farm through each one, at most 1,500 farm decisions per stretch (longer stretches are cut
