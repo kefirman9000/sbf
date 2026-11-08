@@ -778,6 +778,7 @@ class App:
         E.fill_secrets(self.cfg)
         self.settings = E.merge_settings(self.cfg.get("settings"))
         self.settings["_broker"] = self.cfg.get("broker", "alpaca")
+        self.cfg["auto_camp"] = False  # Auto camp too: it only teaches after you switch it on
         self.cfg["roam_on"] = False  # Free roam always starts OFF: it only studies after you switch it on
         wl = self.cfg.get("watchlist")
         if isinstance(wl, list) and wl and all(x in ("BTC", "ETH", "SOL", "XRP", "DOGE", "ADA") for x in wl):
@@ -1105,6 +1106,9 @@ class App:
             if self.cfg.get("roam_on"):
                 self.toggle_roam(False)
                 stopped.append("Free roam")
+            if self.cfg.get("auto_camp"):
+                self.toggle_auto_camp(False)
+                stopped.append("Auto camp")
             if self.cfg.get("slow_on") and hasattr(self, "slow_toggle"):
                 self.slow_toggle()
                 stopped.append("the Slow farm (it keeps what it learned)")
@@ -1127,6 +1131,109 @@ class App:
         self.ess_btn.config(text="\u25cf Essentials only: ON" if on else "\u25cb Essentials only",
                             bg=GREEN if on else LINE, fg="#0b1220" if on else TEXT,
                             activebackground=GREEN if on else LINE, activeforeground="#0b1220" if on else TEXT)
+
+    AUTO_CAMP_MAX = 1500  # most farm decisions in one Auto camp stretch
+
+    def toggle_auto_camp(self, on=None):
+        on = (not self.cfg.get("auto_camp")) if on is None else bool(on)
+        if on and self.essentials_block("Auto camp"):
+            return
+        self.cfg["auto_camp"] = on
+        E.save_json(CONFIG_PATH, self.cfg)
+        if hasattr(self, "camp_btn"):
+            self.camp_btn.config(text="\u2694 Auto camp: ON" if on else "\u2694 Auto camp")
+        if on:
+            self.write("\u2694 Auto camp ON: while the farm runs, practice farms live through stretches of past prices it "
+                       f"picks itself (at most {self.AUTO_CAMP_MAX:,} decisions each), and your farm learns from every "
+                       "one." + ("" if self.tourn else " Start the farm (Wildcard) and it begins."), "good")
+            th = getattr(self, "_camp_worker", None)
+            if th is None or not th.is_alive():
+                self._camp_worker = threading.Thread(target=self._auto_camp_loop, daemon=True, name="auto camp")
+                self._camp_worker.start()
+        else:
+            self.write("\u2694 Auto camp OFF: it stops the stretch in progress; nothing learns in the background.")
+
+    def _auto_camp_loop(self):
+        """Auto camp, one stretch after another while it's ON and the farm runs (Free roam, when on, runs its own)."""
+        self._camp_thread = threading.get_ident()
+        quiet = (E.NoHistory, E.TrainingStopped) + ((E.NeedLogin,) if hasattr(E, "NeedLogin") else ())
+        try:
+            while self.cfg.get("auto_camp") and not self.cfg.get("essentials"):
+                t = self.tourn
+                if not (self.running and self.wild and t and self.seeded) or self.cfg.get("roam_on"):
+                    time.sleep(20)
+                    continue
+                pause = 60
+                try:
+                    self._auto_camp_once(t)
+                except quiet:
+                    pause = 120  # nothing to study right now (offline, a gap in the data): try again shortly
+                except Exception:
+                    self._record_error("auto camp")
+                    pause = 300
+                if not self.cfg.get("roam_on"):
+                    self.roam_now = None  # (the stretch picker shares Free roam's status line)
+                for _ in range(pause):  # a breather between stretches, so the app stays light
+                    if not self.cfg.get("auto_camp"):
+                        break
+                    time.sleep(1)
+        finally:
+            self._camp_thread = None
+
+    def _camp_trim(self, closes, extra, info, n):
+        """Keeps the latest n candles of a stretch (every coin and context series alike)."""
+        L = min(len(x) for x in closes.values())
+        if L <= n:
+            return closes, extra, info
+        closes = {c: list(x[-n:]) for c, x in closes.items()}
+        if extra:
+            extra = {c: {k: (list(v[-n:]) if isinstance(v, (list, tuple)) and len(v) >= n else v) for k, v in d.items()}
+                     if isinstance(d, dict) else d for c, d in extra.items()}
+        info = dict(info, bars=n)
+        ts = next((d.get("t") for d in (extra or {}).values() if isinstance(d, dict) and d.get("t")), None)
+        if ts:
+            info["start"] = ts[0]
+        return closes, extra, info
+
+    def _auto_camp_once(self, t):
+        import random as _r
+        closes, extra, info = self._roam_pick(_r.Random(), 400, prefer=self.farm_gran())
+        closes, extra, info = self._camp_trim(closes, extra, info, self.AUTO_CAMP_MAX)
+        lead = list(t.active[:4]) or [v for v, _ in t.ranking()][:4] or list(t.vars[:4])
+        seeds = [E._genes(v) for v in lead]
+        opts = E.tournament_opts(self.settings)
+        if hasattr(E, "opts_for_bars"):
+            opts = E.opts_for_bars(opts, info["gran"])
+        fee, slip = E.cost_model(self.settings)
+        self.camp_status = f"Auto camp: a practice farm is living through {self._when(info['start'], True)} ({info['bars']:,} candles)"
+        res = E.train_farm(closes, extra, opts, cap=20, passes=1, exam_frac=0.25, seed_genes=seeds,
+                           start_cash=self.start_cash, fee=fee, pct=self.settings["trade_pct"] / 100,
+                           evolve=int(self.settings["evolve_every"]), params=self.settings["params"],
+                           stop=lambda: self.tourn is not t or not self.cfg.get("auto_camp") or bool(self.cfg.get("essentials")))
+
+        def apply():
+            if self.tourn is not t:
+                return
+            E.teach_from(t, res["tourn"])
+            passed = [r for r in res["results"] if r["passed"]]
+            grad = ""
+            nursery = getattr(t, "nursery_full", lambda: False)()
+            if passed and self.seeded and len(t.vars) < t.cap + 2 and not nursery and not info.get("revisit"):
+                g = passed[0]["genes"]
+                v = t.add_variant(g["name"], g["params"], {c: self.hist[c] for c in self.session_coins}, 1.0,
+                                  note="Auto camp graduate:", tf=g["tf"], origin="training camp", risk=g["risk"],
+                                  traits=g["traits"], vetoes=g["vetoes"], layers=g["layers"])
+                if v:
+                    v.layer_stats = {k: list(x) for k, x in passed[0]["layer_stats"].items()}
+                    grad = E.bot_nickname(v.key())
+                    self.refresh_board()
+            self.cfg["auto_camps"] = int(self.cfg.get("auto_camps", 0) or 0) + 1
+            self.camp_status = ""
+            self.write(f"\u2694 Auto camp: a practice farm lived through {self._when(info['start'], True)} to "
+                       f"{self._when(info['end'], True)} ({info['bars']:,} decisions); {len(passed)} passed the exam. "
+                       "Your farm learned its lessons" + (f", and {grad} joined your farm." if grad else "."))
+            self.save_farm(force=True)
+        self.q.put(("call", apply))
 
     def exam_pass(self):
         """Every 20 minutes while the farm runs and Free roam is OFF: up to 3 bots that still need exams are tested on
@@ -1533,7 +1640,7 @@ class App:
                                  cursor="hand2", font=("", 9, "bold"))
         self.ess_btn.pack(side="right", padx=(0, 8))
         Tip(self.ess_btn, "Essentials only: switches off everything that downloads extra history or works the disk in "
-                          "the background (Free roam, the Slow farm, the Scalp lab, background exams, the economic "
+                          "the background (Free roam, Auto camp, the Slow farm, the Scalp lab, background exams, the economic "
                           "calendar refresh, weekly backups). Normal trading and its prices keep running.")
         self.paint_essentials()
         Tip(self.upd_btn, f"You have version {self.version}. Checks GitHub for a newer one; nothing installs until you accept.")
@@ -6643,7 +6750,8 @@ class App:
 
     def roam_check_on(self, t=None):
         """Stops the study in progress as soon as Free roam is switched off (or the farm changes)."""
-        if threading.get_ident() == getattr(self, "_exam_thread", None):  # the exam pass runs with Free roam off
+        if threading.get_ident() in (getattr(self, "_exam_thread", None), getattr(self, "_camp_thread", None)):
+            # the exam pass and Auto camp use Free roam's stretch picker with Free roam off
             if t is not None and self.tourn is not t:
                 raise E.TrainingStopped()
             return
@@ -10030,12 +10138,18 @@ class App:
         tb = ttk.Button(tools, text="\u2694 Train", style="Plain.TButton", command=self.open_training)
         self.roam_btn = ttk.Button(tools, text="\u25c7 Free roam: ON" if self.cfg.get("roam_on") else "\u25c7 Free roam",
                                    style="Plain.TButton", command=self.open_roam)
+        self.camp_btn = ttk.Button(tools, text="\u2694 Auto camp: ON" if self.cfg.get("auto_camp") else "\u2694 Auto camp",
+                                   style="Plain.TButton", command=self.toggle_auto_camp)
+        Tip(self.camp_btn, "Auto training camp: while your farm runs, it keeps picking stretches of past prices by itself, "
+                           "runs a practice farm through each (at most 1,500 decisions per stretch), then teaches your "
+                           "farm what it learned and brings over the best bot that passed its exam. Starts OFF each "
+                           "time the app opens; Essentials only keeps it off.")
         kb = ttk.Button(tools, text="\U0001f4d6 Knowledge", style="Plain.TButton", command=self.open_knowledge)
         Tip(kb, "Everything your farm has learned: see it, save it as a book, and add any of it to another farm.")
         xb = ttk.Button(tools, text="\u21e9 Export", style="Plain.TButton", command=self.export_bots)
         pb = ttk.Button(tools, text="Preset \u25be", style="Plain.TButton")
         pb.configure(command=lambda: self.preset_menu(pb))
-        for b in (db, eb, tb, self.roam_btn, kb, xb, pb):
+        for b in (db, eb, tb, self.roam_btn, self.camp_btn, kb, xb, pb):
             b.pack(side="left", padx=(0, 6))
         Tip(db, "Write your own bot: strategy, numbers (like RSI buy below 28 / sell above 72), pace, exits and habits. (Ctrl+E)")
         Tip(eb, "Hatch brand-new random bots now. They learn on recent prices and have to earn their place.")
