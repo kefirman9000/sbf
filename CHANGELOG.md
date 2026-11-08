@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.4.0
+- **Training camp: Randomize, Auto and Max decisions.**
+  - **Max decisions** (default 5,000): the most farm decisions one run may take (candles x passes). Longer periods are
+    cut to their latest candles, so a run can't grow huge.
+  - **Randomize** picks a period, candle size, passes, farm size and starting bots for you, always under Max decisions,
+    and mostly on your farm's own candle size so its graduates fit your farm.
+  - **Auto** runs one camp after another with random settings. After each one your farm learns from it and up to 3
+    bots that passed the exam join your farm. 30 seconds between runs; it runs while the Training camp window is open,
+    stops with Stop (or untick Auto), gives up after 5 runs in a row that can't finish, and Essentials only keeps it off.
+
 ## 1.3.1
 - Fixed: Auto camp's (or the exam pass's) first stretch after the app started could fail with "no attribute roam_log"
   when Free roam hadn't loaded its study log yet; it then waited 5 minutes before trying again. The log now loads

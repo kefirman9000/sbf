@@ -6143,6 +6143,7 @@ class App:
         size = tk.StringVar(value=str(c.get("tc_size", int(self.settings.get("max_bots", 30)))))
         exam = tk.StringVar(value=c.get("tc_exam", "25%"))
         start = tk.StringVar(value=c.get("tc_start", "Fresh eggs"))
+        maxdec = tk.StringVar(value=str(c.get("tc_max_dec", 5000)))
         for idx, (lab, var, vals, wd) in enumerate((
                 ("Passes", passes, ["1", "2", "3", "4", "5"], 3), ("Farm size", size, ["20", "30", "40", "60", "80", "120"], 4),
                 ("Final exam", exam, ["None", "15%", "25%", "35%"], 6),
@@ -6152,6 +6153,20 @@ class App:
             ttk.Combobox(f, textvariable=var, values=vals, state="readonly" if lab not in ("Farm size",) else "normal",
                          width=wd).grid(row=r0 + 1, column=col, sticky="w", padx=(0, 14))
         coins = list(self.session_coins or [k for k, x in self.coin_vars.items() if x.get()] or ["SPY", "QQQ"])
+        ttk.Label(f, text="Max decisions").grid(row=4, column=4, sticky="w", padx=(0, 14))
+        md = ttk.Combobox(f, textvariable=maxdec, values=["1500", "3000", "5000", "8000", "12000"], width=7)
+        md.grid(row=5, column=4, sticky="w", padx=(0, 14))
+        Tip(md, "The most farm decisions one run may take (candles x passes). Longer periods are cut to their latest "
+                "candles, so no run grows huge. Auto and Randomize stay under it too.")
+
+        def max_dec():
+            try:
+                return max(300, min(self.TC_MAX * 5, int(float(maxdec.get()))))
+            except ValueError:
+                return 5000
+
+        def limit_for(n_pass):  # candles per run, so candles x passes stays under Max decisions
+            return max(300, min(self.TC_MAX, max_dec() // max(1, n_pass)))
         cf_ = ttk.Frame(f)
         cf_.grid(row=3, column=0, columnspan=6, sticky="w", pady=(0, 8))
         ttk.Label(cf_, text="Tickers to train on").pack(side="left")
@@ -6166,10 +6181,14 @@ class App:
             except ValueError:
                 return note.config(text="Write the start date like 2020-03-02.")
             n = self.est_candles(a, b, per["gran"]())
-            cap = f" (only the latest {self.TC_MAX:,} are used: pick bigger candles for the whole period)" if n > self.TC_MAX else ""
-            note.config(text=f"Tickers: {', '.join(self.parse_coins(tc_coins.get()) or coins)}   |   about {min(n, self.TC_MAX):,} candles per ticker{cap}   |   "
-                             f"about {min(n, self.TC_MAX) * int(passes.get() or 1):,} farm decisions in total")
-        for var in (per["length"], per["candle"], per["when"], per["date"], passes, tc_coins):
+            try:
+                lim = limit_for(int(passes.get() or 1))
+            except ValueError:
+                lim = limit_for(1)
+            cap = f" (only the latest {lim:,} are used, to stay under Max decisions)" if n > lim else ""
+            note.config(text=f"Tickers: {', '.join(self.parse_coins(tc_coins.get()) or coins)}   |   about {min(n, lim):,} candles per ticker{cap}   |   "
+                             f"about {min(n, lim) * int(passes.get() or 1):,} farm decisions in total")
+        for var in (per["length"], per["candle"], per["when"], per["date"], passes, tc_coins, maxdec):
             var.trace_add("write", update_note)
         update_note()
         row = ttk.Frame(f)
@@ -6178,6 +6197,16 @@ class App:
         go.pack(side="left")
         stop_b = ttk.Button(row, text="Stop", state="disabled")
         stop_b.pack(side="left", padx=6)
+        rnd_b = ttk.Button(row, text="\U0001f3b2 Randomize", style="Plain.TButton")
+        rnd_b.pack(side="left", padx=(0, 6))
+        Tip(rnd_b, "Picks a random period, candle size, passes, farm size and starting bots for you, always under Max "
+                   "decisions (mostly on your farm's own candle size, so its graduates fit your farm).")
+        auto_var = tk.BooleanVar(value=False)
+        auto_cb = ttk.Checkbutton(row, text="Auto", variable=auto_var)
+        auto_cb.pack(side="left", padx=(0, 6))
+        Tip(auto_cb, "Auto: runs one Training camp after another with random settings (under Max decisions). After each "
+                     "run your farm learns from it and the bots that passed the exam join your farm. Runs while this "
+                     "window is open; Stop or untick to end it. Essentials only keeps it off.")
         bar = ttk.Progressbar(row, length=360, mode="determinate")
         bar.pack(side="left", padx=10)
         status = ttk.Label(row, text="", foreground=MUTED)
@@ -6224,7 +6253,7 @@ class App:
             except ValueError:
                 return messagebox.showerror("Training camp", "Farm size must be a number (14 to 200).", parent=w)
             ex = {"None": 0.0, "15%": 0.15, "25%": 0.25, "35%": 0.35}[exam.get()]
-            self.cfg.update(tc_passes=n_pass, tc_size=cap, tc_exam=exam.get(),
+            self.cfg.update(tc_passes=n_pass, tc_size=cap, tc_exam=exam.get(), tc_max_dec=max_dec(),
                             tc_start=start.get())
             E.save_json(CONFIG_PATH, self.cfg)
             seeds = []
@@ -6257,7 +6286,7 @@ class App:
                 try:
                     closes, extra, info = self.load_stretch(
                         coins, gran, pa, pb, lambda txt: self.q.put(("call", lambda: status.config(text=txt) if w.winfo_exists() else None)),
-                        self.TC_MAX)
+                        limit_for(n_pass))
                     if info["bars"] < 300:
                         raise RuntimeError(f"only {info['bars']} candles in that period: pick a longer period or smaller candles")
                     res = E.train_farm(closes, extra, opts, cap=cap, passes=n_pass, exam_frac=ex, seed_genes=seeds,
@@ -6268,9 +6297,19 @@ class App:
                 except E.TrainingStopped:
                     self.q.put(("call", lambda: finish("Stopped.")))
                 except Exception as e:
-                    self.q.put(("call", lambda e=e: (finish(""), messagebox.showerror("Training camp", f"Couldn't finish: {e}", parent=w))
-                                if w.winfo_exists() else None))
+                    self.q.put(("call", lambda e=e: auto_failed(e) if w.winfo_exists() else None))
             threading.Thread(target=work, daemon=True).start()
+
+        def auto_failed(e):
+            finish("")
+            if not auto_var.get():
+                return messagebox.showerror("Training camp", f"Couldn't finish: {e}", parent=w)
+            st["fails"] = st.get("fails", 0) + 1
+            if st["fails"] >= 5:
+                auto_var.set(False)
+                return status.config(text=f"Auto stopped after 5 runs in a row couldn't finish (last: {e}).")
+            status.config(text=f"That one couldn't run ({e}); trying other settings...")
+            auto_next(10)
 
         def finish(text):
             if not w.winfo_exists():
@@ -6302,6 +6341,13 @@ class App:
             for b in (b_bring, b_teach, b_lib):
                 b.config(state="normal")
             self.write(f"⚔ Training camp finished: {passed} of {len(res['results'])} top bots passed the exam.", "good")
+            if auto_var.get():
+                st["fails"] = 0
+                try:
+                    auto_apply(res)
+                except Exception:
+                    E.note_error("auto training camp")
+                auto_next()
 
         def chosen():
             res = st["res"]
@@ -6360,7 +6406,88 @@ class App:
                                            trades=r["trades"], segments_passed=int(bool(r["passed"])), segments=1)]
             self.catch_rows(entries, "training camp")
         go.config(command=run)
-        stop_b.config(command=lambda: (st.__setitem__("stop", True), status.config(text="Stopping...")))
+        stop_b.config(command=lambda: (st.__setitem__("stop", True), auto_var.set(False), status.config(text="Stopping...")))
+
+        def randomize():
+            import random as _r
+            rng = _r.Random()
+            farm_s = int(self.farm_gran())
+            cands = [nm for nm, g in self.CANDLES if g == farm_s] or [self.CANDLES[0][0]]
+            others = [nm for nm, g in self.CANDLES if g != farm_s and g <= 3600]
+            cn = cands[0] if rng.random() < 0.75 or not others else rng.choice(others)
+            gran = dict(self.CANDLES)[cn]
+            n_pass = rng.choice([1, 1, 2, 2, 3])
+            lim = limit_for(n_pass)
+
+            def est(nm):  # candles in that period (markets that close count only their open hours)
+                try:
+                    a_, b_ = self.period_bounds(nm, "Most recent", per["date"].get())
+                    return self.est_candles(a_, b_, gran)
+                except Exception:
+                    return dict(self.PERIODS)[nm] * 86400 / gran
+            fits = [nm for nm, _ in self.PERIODS if 600 <= est(nm) <= lim * 1.2] or \
+                [min(self.PERIODS, key=lambda x: abs(est(x[0]) - lim))[0]]
+            per["candle"].set(cn)
+            per["length"].set(rng.choice(fits))
+            days = dict(self.PERIODS)[per["length"].get()]
+            if rng.random() < 0.3:
+                per["when"].set("Most recent")
+            else:  # somewhere in the last 3 years (newer tickers don't go back further)
+                back = rng.uniform(days + 2, max(days + 3, 3 * 365))
+                per["when"].set("Starting on")
+                per["date"].set((datetime.now() - timedelta(days=back)).strftime("%Y-%m-%d"))
+            passes.set(str(n_pass))
+            size.set(str(rng.choice([20, 30, 40])))
+            exam.set("25%")
+            starts = ["Fresh eggs"] + (["My current farm"] * 2 if self.tourn else []) + (["Hall of Fame"] if self.hof() else [])
+            start.set(rng.choice(starts))
+            update_note()
+
+        def auto_apply(res):
+            """Auto: the farm learns from the run and its exam passers join it (no pop-ups)."""
+            if not (self.tourn and self.seeded):
+                return self.write("\u2694 Auto training camp: start your farm (Wildcard) and the camps' lessons and "
+                                  "graduates go to it.", "warn")
+            E.teach_from(self.tourn, res["tourn"])
+            closes = {c_: self.hist[c_] for c_ in self.session_coins}
+            n = 0
+            for r in [r for r in res["results"] if r["passed"]][:3]:
+                g = r["genes"]
+                v = self.tourn.add_variant(g["name"], g["params"], closes, 1.0, note="From the auto training camp:",
+                                           tf=g["tf"], origin="training camp", risk=g["risk"], traits=g["traits"],
+                                           vetoes=g["vetoes"], layers=g["layers"])
+                if v:
+                    v.layer_stats = {k: list(x) for k, x in r["layer_stats"].items()}
+                    n += 1
+            self.flush_events()
+            self.refresh_board()
+            self.save_farm(force=True)
+            self.write("\u2694 Auto training camp: your farm learned from it" +
+                       (f", and {n} bot{'s' if n != 1 else ''} that passed joined your farm." if n else "."), "good")
+
+        def auto_next(delay=30):
+            if not (auto_var.get() and w.winfo_exists()):
+                return
+            if self.cfg.get("essentials"):
+                auto_var.set(False)
+                return status.config(text="Auto stopped: Essentials only is on.")
+            status.config(text=f"Auto: next camp in {delay} seconds...")
+
+            def go_again():
+                if auto_var.get() and w.winfo_exists() and str(go.cget("state")) != "disabled":
+                    randomize()
+                    run()
+            w.after(delay * 1000, go_again)
+
+        def auto_toggled():
+            if auto_var.get():
+                if self.essentials_block("Auto training camp"):
+                    return auto_var.set(False)
+                st["fails"] = 0
+                if str(go.cget("state")) != "disabled":
+                    auto_next(1)
+        auto_cb.config(command=auto_toggled)
+        rnd_b.config(command=randomize)
         b_bring.config(command=bring)
         b_teach.config(command=teach)
         b_lib.config(command=save_lib)
