@@ -11,7 +11,7 @@ import os
 import re
 import shutil
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 WARM = 30  # bars skipped at the start of a backtest so indicators have data
@@ -1075,7 +1075,7 @@ SOUNDS = {  # (frequency Hz, start s, length s) notes; synthesized, so nothing t
 
 
 # ---------------- account-wide safety limits ----------------
-LIMIT_DEFAULTS = {"max_open": 10, "loss_streak": 5, "streak_pause": 30.0}  # (the limit per ticker already existed)
+LIMIT_DEFAULTS = {"max_open": 10, "loss_streak": 5, "streak_pause": 30.0, "fill_learn": True, "earnings_guard": 1}  # (the limit per ticker already existed)
 
 LIMIT_SETTINGS = (  # (key, explanation, type) for the Settings window, shown after the daily loss limit
     ("max_open", "Most open positions: the account never holds more than this many positions at once, whatever the bots "
@@ -1084,6 +1084,15 @@ LIMIT_SETTINGS = (  # (key, explanation, type) for the Settings window, shown af
                     "(0 = off). Sells and safety exits still happen", int),
     ("streak_pause", "How long the losing-streak pause lasts, in minutes", float),
 )
+EARN_SETTINGS = (
+    ("earnings_guard", "Earnings guard: the account opens nothing in a stock this many trading days before it reports "
+                       "earnings (1 = not the day before or the day of; 0 = off). Prices often jump on the report, and "
+                       "options lose much of their value right after it", int),
+)
+FILL_SETTINGS = (
+    ("fill_learn", "Learn from paper fills: with 'Both' on, compare each practice trade with its Alpaca paper copy, and "
+                   "make practice charge what real fills really cost (after 10 copies)", bool),
+)
 
 
 def book_ticker(c):
@@ -1091,7 +1100,7 @@ def book_ticker(c):
     return str(c).split("~")[0]
 
 
-class FarmAppMixin:
+class FarmAppMixin:  # (FillCheckMixin, defined below, joins it in apps with Alpaca paper copies)
     """App behaviour shared by CBBF, OBF and SBF: account-wide safety limits and the farm doctor. It relies on the
     attributes every app has (settings, pos, position_price, equity, tourn, running, cfg, root, write, ...)."""
 
@@ -1104,6 +1113,11 @@ class FarmAppMixin:
         now = time.time()
         if st.get("until", 0) > now:
             return f"losing-streak pause ({int((st['until'] - now) // 60) + 1} min left)"
+        ed = int(s.get("earnings_guard", 0) or 0)
+        if ed > 0 and getattr(self, "HAS_EARNINGS", False):
+            k = earn_days_ahead(c, now)
+            if k is not None and k < ed:
+                return earnings_text(c, now) + f" (you don't open anything {ed} trading day{'s' if ed > 1 else ''} before)"
         held = [k for k, q in self.pos.items() if q > 0]
         mo = int(s.get("max_open", 0) or 0)
         if mo > 0 and c not in held and len(held) >= mo:
@@ -1200,6 +1214,22 @@ class FarmAppMixin:
             elif idle > 45 * 60 and t is not None:
                 add("roam_idle", "warn", f"Free roam hasn't studied anything for {int(idle // 60)} minutes",
                     "It may be waiting for history it can't download, or for a login.", "roam_restart", "Restart Free roam")
+        if hasattr(self, "fill_stats"):
+            fs = self.fill_stats()
+            if fs["n"] >= 10 and fs["rate"] is not None and fs["rate"] < 0.7:
+                add("fills", "warn", f"Only {fs['rate'] * 100:.0f}% of Alpaca paper copies filled",
+                    "Practice assumes every order fills; on the real exchange many didn't, so practice results are "
+                    "rosier than they'd be. Wider limit waits (Settings > Orders) or more liquid tickers help.")
+            if fs["priced"] >= 10 and fs["median"] is not None and abs(fs["median"]) >= 1:
+                add("fillcost", "info", f"Real fills are {fs['median']:+.1f}% away from practice",
+                    self.fill_text())
+        if getattr(self, "HAS_EARNINGS", False):
+            soon = sorted({book_ticker(k) for k, q in self.pos.items() if q > 0
+                           and (earn_days_ahead(k, now) is not None and earn_days_ahead(k, now) <= 1)})
+            if soon:
+                add("earnings", "warn", "Holding through earnings: " + ", ".join(soon),
+                    "; ".join(earnings_text(x, now) for x in soon) + ". Prices often jump on the report, and options "
+                    "usually lose much of their extra value right after it.")
         errs = int(getattr(self, "err_count", 0) or 0)
         if errs >= 5:
             add("errors", "warn", f"{errs} errors this run",
@@ -1405,3 +1435,212 @@ def loosen_silent(t, every=10):
         k += 1
         t.events.append(f"Loosened {v.label}: dropped {what} (no trades in a whole window)")
     return k
+
+
+# ---------------- practice vs Alpaca paper: what real fills cost ----------------
+FILL_MIN = 10      # paper copies before practice prices adjust to them
+FILL_KEEP = 400
+
+
+class FillCheckMixin:
+    """With 'Both' on, every practice trade is also placed on Alpaca paper. Comparing the two prices shows how far
+    practice fills are from real ones; practice then charges the difference (Settings > Learn from paper fills)."""
+
+    def _fill_path(self):
+        import sys
+        return os.path.join(sys.modules["engine"].HOME_DIR, "fill-check.json")
+
+    def fill_book(self):
+        b = self.__dict__.get("_fill_book")
+        if b is None:
+            try:
+                with open(self._fill_path(), encoding="utf-8") as f:
+                    b = json.load(f)
+            except (OSError, ValueError):
+                b = []
+            b = self._fill_book = [x for x in b if isinstance(x, dict)][-FILL_KEEP:]
+        return b
+
+    def fill_note_practice(self, c, side, px):
+        """The practice side of a trade that may be copied to Alpaca paper (called as practice trades are logged)."""
+        self.__dict__.setdefault("_fill_px", {})[c] = (side, float(px), time.time())
+
+    def fill_note_paper(self, c, side, paper_px):
+        """The paper side: its fill price, or None when the copy didn't fill."""
+        p = (self.__dict__.get("_fill_px") or {}).get(c)
+        if not p or p[0] != side or time.time() - p[2] > 900 or p[1] <= 0:
+            return
+        x = dict(t=round(time.time()), ticker=book_ticker(c), side=side, practice=round(p[1], 6), filled=paper_px is not None)
+        if paper_px is not None:
+            d = (paper_px - p[1]) / p[1] if side == "buy" else (p[1] - paper_px) / p[1]
+            x["paper"], x["cost"] = round(float(paper_px), 6), round(d * 100, 3)  # cost: % worse on paper (negative = better)
+        b = self.fill_book()
+        b.append(x)
+        del b[:-FILL_KEEP]
+        try:
+            with open(self._fill_path(), "w", encoding="utf-8") as f:
+                json.dump(b, f)
+        except OSError:
+            pass
+
+    def fill_stats(self, side=None):
+        """-> dict(n, filled, rate, median cost %) of the paper copies (one side or both)."""
+        b = [x for x in self.fill_book() if side in (None, x.get("side"))]
+        costs = sorted(x["cost"] for x in b if x.get("filled") and "cost" in x)
+        med = costs[len(costs) // 2] if costs else None
+        filled = sum(1 for x in b if x.get("filled"))
+        return dict(n=len(b), filled=filled, rate=filled / len(b) if b else None, median=med, priced=len(costs))
+
+    def fill_adjust(self, side):
+        """Extra cost (a fraction of the price) practice adds to a buy or sell, learned from the paper copies:
+        0 until there are enough of them, or with the switch off."""
+        if not self.settings.get("fill_learn", True):
+            return 0.0
+        st = self.fill_stats(side)
+        if st["priced"] < FILL_MIN or st["median"] is None:
+            return 0.0
+        return max(-0.01, min(0.05, st["median"] / 100))
+
+    def fill_text(self):
+        st, b, s = self.fill_stats(), self.fill_stats("buy"), self.fill_stats("sell")
+        if not st["n"]:
+            return "No paper copies yet (turn on 'Both' so practice trades are also placed on Alpaca paper)."
+        pc = lambda x: "-" if x is None else f"{x:+.2f}%"
+        txt = (f"{st['n']} copies, {st['rate'] * 100:.0f}% filled. Real fills vs practice: buys {pc(b['median'])}, "
+               f"sells {pc(s['median'])} (median; positive = real fills were worse).")
+        if st["priced"] < FILL_MIN:
+            return txt + f" Practice adjusts after {FILL_MIN} priced copies."
+        return txt + (f" Practice now charges buys {self.fill_adjust('buy') * 100:+.2f}% and sells "
+                      f"{self.fill_adjust('sell') * 100:+.2f}% to match." if self.settings.get("fill_learn", True)
+                      else " (Learning from them is off in Settings.)")
+
+
+# ---------------- earnings dates (stocks and options; crypto has none) ----------------
+EARN_URL = "https://api.nasdaq.com/api/calendar/earnings?date={d}"  # one day of US earnings reports, free
+_EARN = {"book": None, "index": None}
+
+
+def _earn_path():
+    import sys
+    return os.path.join(sys.modules["engine"].HOME_DIR, "cache", "earnings.json")
+
+
+def earnings_book():
+    """{"days": {date: {symbol: 'bmo'|'amc'|'?'}}, "fetched": {date: when}} from the saved calendar."""
+    if _EARN["book"] is None:
+        try:
+            with open(_earn_path(), encoding="utf-8") as f:
+                b = json.load(f)
+        except (OSError, ValueError):
+            b = {}
+        _EARN["book"] = dict(days=dict(b.get("days") or {}), fetched=dict(b.get("fetched") or {}))
+        _EARN["index"] = None
+    return _EARN["book"]
+
+
+def _earn_save():
+    p = _earn_path()
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(earnings_book(), f)
+    os.replace(p + ".tmp", p)
+
+
+def parse_earnings_day(text):
+    """{symbol: 'bmo'|'amc'|'?'} from one day of Nasdaq's earnings calendar (JSON text)."""
+    try:
+        rows = ((json.loads(text) or {}).get("data") or {}).get("rows") or []
+    except (ValueError, AttributeError):
+        return None
+    out = {}
+    for r in rows:
+        sym = str(r.get("symbol") or "").strip().upper()
+        if sym:
+            tm = str(r.get("time") or "")
+            out[sym] = "bmo" if "pre-market" in tm else "amc" if "after-hours" in tm else "?"
+    return out
+
+
+def fetch_earnings(dates, get, pause=0.4, refetch_after=12 * 3600):
+    """Downloads the earnings calendar for `dates` (YYYY-MM-DD) that aren't saved yet (future days are refreshed every
+    12 hours, since companies confirm or move their dates). get(url) -> text. -> how many days were downloaded."""
+    b, now, n = earnings_book(), time.time(), 0
+    today = datetime.now().strftime("%Y-%m-%d")
+    for d in dates:
+        at = b["fetched"].get(d)
+        if at and (d < today or now - at < refetch_after):
+            continue
+        day = parse_earnings_day(get(EARN_URL.format(d=d)))
+        if day is None:
+            continue
+        b["days"][d], b["fetched"][d] = day, now
+        n += 1
+        time.sleep(pause)
+    if n:
+        _EARN["index"] = None
+        _earn_save()
+    return n
+
+
+def _earn_index():
+    if _EARN["index"] is None:
+        idx = {}
+        for d, syms in earnings_book()["days"].items():
+            for s, when in (syms or {}).items():
+                ts = ny_time(d, 9, 30) if when == "bmo" else ny_time(d, 16, 0)  # after the close unless said otherwise
+                idx.setdefault(s, []).append(ts)
+        _EARN["index"] = {s: sorted(v) for s, v in idx.items()}
+    return _EARN["index"]
+
+
+def next_earnings(sym, ts):
+    """When `sym` next reports earnings after time `ts` (a timestamp), or None if no report is known."""
+    for x in _earn_index().get(book_ticker(sym).upper(), ()):
+        if x > ts:
+            return x
+    return None
+
+
+def earn_days_ahead(sym, ts):
+    """Weekdays from `ts` until `sym`'s next earnings report (0 = it reports later today), or None if unknown."""
+    nx = next_earnings(sym, ts)
+    if nx is None:
+        return None
+    a = datetime.fromtimestamp(ts, timezone.utc) - timedelta(hours=_ny_offset(datetime.fromtimestamp(ts, timezone.utc)))
+    b = datetime.fromtimestamp(nx, timezone.utc) - timedelta(hours=_ny_offset(datetime.fromtimestamp(nx, timezone.utc)))
+    days, d = 0, a.date()
+    while d < b.date():
+        d += timedelta(days=1)
+        if d.weekday() < 5:
+            days += 1
+    return days
+
+
+def _earn_get(url):
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json, text/plain, */*"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def earnings_loop(app, every=6 * 3600):
+    """Background: keeps the earnings calendar for the next six weeks (and the last week) up to date, every 6 hours,
+    unless Essentials only is on. Failures are quiet: without a calendar the earnings rules simply don't act."""
+    while True:
+        try:
+            if not app.cfg.get("essentials"):
+                today = datetime.now()
+                dates = [(today + timedelta(days=k)).strftime("%Y-%m-%d") for k in range(-7, 43)
+                         if (today + timedelta(days=k)).weekday() < 5]
+                fetch_earnings(dates, _earn_get)
+        except Exception:
+            pass
+        time.sleep(every)
+
+
+def earnings_text(sym, ts=None):
+    nx = next_earnings(sym, ts or time.time())
+    if nx is None:
+        return None
+    d = datetime.fromtimestamp(nx)
+    return f"{book_ticker(sym)} reports earnings {d:%a %b %d} " + ("before the open" if d.hour < 12 else "after the close")

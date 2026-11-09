@@ -120,3 +120,57 @@ def test_silent_bot_loses_a_gate_and_gets_a_fresh_window():
     v.age = 900
     seen = [loosen_gate(v) for _ in range(5)]
     assert seen[-1] is None and v.traits == {} and v.layers.get("need") == 1 and not v.layers.get("plus")
+
+
+def test_paper_fills_teach_practice_its_costs(tmp_path, monkeypatch):
+    import sys
+    import types
+    from farmcore import FillCheckMixin, FILL_MIN
+
+    monkeypatch.setitem(sys.modules, "engine", types.SimpleNamespace(HOME_DIR=str(tmp_path)))
+
+    class A(App, FillCheckMixin):
+        pass
+
+    a = A()
+    assert a.fill_adjust("buy") == 0.0 and "No paper copies" in a.fill_text()
+    for i in range(FILL_MIN):
+        a.fill_note_practice("SPY", "buy", 2.00)
+        a.fill_note_paper("SPY", "buy", 2.04)  # real buys paid 2% more
+        a.fill_note_practice("SPY", "sell", 3.00)
+        a.fill_note_paper("SPY", "sell", 3.00 if i % 2 else None)  # half the sells didn't fill
+    assert abs(a.fill_adjust("buy") - 0.02) < 1e-9 and a.fill_adjust("sell") == 0.0
+    st = a.fill_stats()
+    assert st["n"] == 2 * FILL_MIN and abs(st["rate"] - 0.75) < 1e-9
+    assert "fills" not in {f["key"] for f in a.doctor_findings()}  # 75% filled: fine
+    a.settings["fill_learn"] = False
+    assert a.fill_adjust("buy") == 0.0
+    b = A()  # a fresh app reads the saved comparison back
+    assert b.fill_stats()["n"] == 2 * FILL_MIN
+
+
+def test_earnings_calendar_guard_and_rule(tmp_path, monkeypatch):
+    import sys
+    import types
+    import farmcore as F
+
+    monkeypatch.setitem(sys.modules, "engine", types.SimpleNamespace(HOME_DIR=str(tmp_path)))
+    monkeypatch.setattr(F, "_EARN", {"book": None, "index": None})
+    day = {"data": {"rows": [{"symbol": "AAPL", "time": "time-after-hours"}, {"symbol": "MSFT", "time": "time-pre-market"}]}}
+    import json as _j
+    got = F.fetch_earnings(["2026-11-04"], lambda url: _j.dumps(day), pause=0)
+    assert got == 1 and F.earnings_book()["days"]["2026-11-04"] == {"AAPL": "amc", "MSFT": "bmo"}
+    mon = F.ny_time("2026-11-02", 12, 0)  # Monday noon, two trading days before
+    assert F.earn_days_ahead("AAPL", mon) == 2 and F.earn_days_ahead("AAPL~scalp", mon) == 2
+    assert F.earn_days_ahead("MSFT", F.ny_time("2026-11-04", 10, 0)) is None  # already reported that morning
+    assert F.earn_days_ahead("NVDA", mon) is None
+
+    class A(App):
+        HAS_EARNINGS = True
+
+    a = A(earnings_guard=1)
+    assert a.limit_block("AAPL", 10) is None or "earnings" not in a.limit_block("AAPL", 10)
+    monkeypatch.setattr(F.time, "time", lambda: F.ny_time("2026-11-04", 11, 0))  # the day it reports
+    assert "earnings" in a.limit_block("AAPL", 10)
+    a.settings["earnings_guard"] = 0
+    assert a.limit_block("AAPL", 10) is None

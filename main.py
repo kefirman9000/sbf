@@ -61,7 +61,7 @@ from datetime import date, datetime, timedelta
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import engine as E
-from farmcore import FarmAppMixin, LIMIT_SETTINGS  # safety limits and the farm doctor, shared by the apps
+from farmcore import FarmAppMixin, FillCheckMixin, LIMIT_SETTINGS, FILL_SETTINGS, EARN_SETTINGS, earnings_loop  # safety limits and the farm doctor, shared by the apps
 import broker as B
 
 # ---- Update settings: change to your GitHub "user/repo" after publishing ----
@@ -141,6 +141,8 @@ SETTING_GROUPS = [
         ("daily_loss", "Daily loss limit: stop trading for the rest of the day if the account falls this % since "
                        "midnight. Open positions are kept, not sold (0 = off). The TODAY tile shows how close you are", float),
         *LIMIT_SETTINGS,
+        *FILL_SETTINGS,
+        *EARN_SETTINGS,
         ("pdt_guard", "Day-trade guard: under $25,000, never make a 4th day trade (buy and sell the same stock the same "
                       "day) in 5 business days, so the broker doesn't flag the account as a pattern day trader. Safety "
                       "exits (stops, kill switch, your own sells) still go through", bool),
@@ -746,7 +748,8 @@ def read_version():
         return "0.0.0"
 
 
-class App(FarmAppMixin):
+class App(FarmAppMixin, FillCheckMixin):
+    HAS_EARNINGS = True  # stocks report earnings (the earnings guard, rule and calendar)
     def __init__(self, root, tray=False):
         self.tray_mode, self.tray = bool(tray), None  # tray: started in the background (icon by the clock)
         # Background learning (Free roam, Slow farm, Training camp) shares Python with the window. Handing control
@@ -1880,6 +1883,7 @@ class App(FarmAppMixin):
         self.tile_frames["broker"].grid_remove()  # shown once there's an Alpaca account to read
         tiles.columnconfigure(5, weight=0)
         threading.Thread(target=self._broker_loop, daemon=True).start()
+        threading.Thread(target=earnings_loop, args=(self,), daemon=True).start()  # earnings calendar (farmcore)
         self.root.after(50, self.apply_compact)
         self.verdict_lbl = tk.Label(right, text="", bg=BG, fg=MUTED, anchor="w", font=("", 10, "bold"))
         self.verdict_lbl.pack(fill="x", pady=(6, 0))
@@ -2829,12 +2833,15 @@ class App(FarmAppMixin):
             return
         if rec is None:
             self.mirror.pop(c, None)
+            if "fill" in err:
+                self.fill_note_paper(c, "buy", None)
             if time.time() - getattr(self, "_mirror_note", 0) > 600:
                 self._mirror_note = time.time()
                 self.write(f"ALPACA PAPER: the copy of {self.contract_label(c)} wasn't placed ({err}). The PRACTICE trade "
                            "itself is unaffected.", "warn")
             return
         self.mirror[c] = rec
+        self.fill_note_paper(c, "buy", rec["avg"])
         self._mirror_row("buy", c, rec["qty"], rec["avg"], rec["cost"], None, reason, rec)
         if self.pos.get(c, 0) <= 0:  # the practice trade closed while the copy was on its way
             self.mirror_close(c, "sync")
@@ -2869,11 +2876,14 @@ class App(FarmAppMixin):
             return
         if fill is None:
             rec.pop("closing", None)
+            if "fill" in err:
+                self.fill_note_paper(c, "sell", None)
             if time.time() - getattr(self, "_mirror_note", 0) > 600:
                 self._mirror_note = time.time()
                 self.write(f"ALPACA PAPER: couldn't sell the copy of {self.contract_label(c)} yet ({err}); trying again.", "warn")
             return
         got, avg = fill
+        self.fill_note_paper(c, "sell", avg)
         proceeds = got * avg
         basis = rec["cost"] * min(1.0, got / rec["qty"]) if rec["qty"] else rec["cost"]
         self._mirror_row("sell", c, got, avg, proceeds, proceeds - basis, reason, rec)
@@ -9751,6 +9761,7 @@ class App(FarmAppMixin):
             self.executor.submit(self.live_open, c, S, spend, reason)
             return
         fee, slip = E.cost_model(self.settings)
+        slip += self.fill_adjust("buy")  # what Alpaca paper fills showed real buys cost (0 until it knows)
         fill = S * (1 + slip)
         qty = spend * (1 - fee) / fill
         self.fees_paid += spend * fee + qty * S * slip
@@ -9782,6 +9793,7 @@ class App(FarmAppMixin):
             return
         value = self.position_price(c)
         fee, slip = E.cost_model(self.settings)
+        slip += self.fill_adjust("sell")
         fill = value * (1 - slip)
         proceeds = qty * fill * (1 - fee)
         self.fees_paid += qty * value * slip + qty * fill * fee
@@ -9797,6 +9809,7 @@ class App(FarmAppMixin):
     def log_trade(self, side, c, qty, px, usd, pl, reason):
         if side == "sell" and pl is not None:
             self.limit_note_close(pl)
+        self.fill_note_practice(c, side, px)
         acct_ = self.acct_name()
         row = dict(time=datetime.now().isoformat(timespec="seconds"), mode={"PRACTICE": "paper", "ALPACA PAPER": "alpaca"}.get(acct_, "live"),
                    acct=acct_,
@@ -12074,6 +12087,9 @@ class App(FarmAppMixin):
         tk.Label(parent, bg=CARD, fg=MUTED, anchor="w", padx=8, font=("", 8), justify="left", wraplength=1100, text=(
             "What's really in your Alpaca account (the paper or live one your key belongs to), read straight from Alpaca. "
             "Resetting SBF never closes these. 'Tracked by SBF' says which part of SBF looks after each one.")).pack(fill="x")
+        self.al_fills = tk.Label(parent, bg=CARD, fg=TEXT, anchor="w", padx=8, font=("", 8, "bold"), justify="left",
+                                 wraplength=1100, text="")
+        self.al_fills.pack(fill="x")
         box = tk.Frame(parent, bg=CARD)
         box.pack(fill="both", expand=True, padx=6, pady=(2, 6))
         cols = ("contract", "qty", "avg", "paid", "worth", "pl", "plpct", "who")
@@ -12097,6 +12113,8 @@ class App(FarmAppMixin):
         self.root.after(30000, self._al_tick)
 
     def refresh_alpaca(self, quiet=False):
+        if hasattr(self, "al_fills"):
+            self.al_fills.config(text="Practice vs real fills: " + self.fill_text())
         if getattr(self, "al_tree", None) is None or getattr(self, "_al_busy", False):
             return
         if not E.ALPACA.get("key"):
