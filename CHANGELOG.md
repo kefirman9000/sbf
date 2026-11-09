@@ -1,5 +1,19 @@
 # Changelog
 
+
+## 1.5.0
+- **Farm doctor** (top bar, next to Essentials only): checks the farm and the app every minute and offers a fix
+  where there is one: a farm far past its size (one click trims it), most bots unjudged, no bot proven for hours,
+  few exams, prices that stopped coming, Free roam stuck or idle, errors piling up, one strategy taking over, and
+  today's loss limit or a losing-streak pause. The button turns amber or red when something needs you, and says
+  so once in the log.
+- **Safety limits for the account**, enforced whatever the bots decide (Settings, after the daily loss limit):
+  **Most open positions** (default 10), and a **Losing-streak pause** (after 5 losing trades in a row, nothing new
+  opens for 30 minutes). Sells and safety exits are never blocked. Together with the daily loss limit and the limit
+  per ticker you already had.
+- **Fix: an overfull saved farm now really shrinks back to its size when it loads.** Loading stretched the size to
+  fit every bot, so the trim did nothing and a 60-bot farm could stay at 125.
+
 ## 1.4.1
 - Training camp Auto: **Stop now works while it waits** between camps (it cancels the next one), the wait shows a
   countdown, and a **wait** choice sets the pause between camps (0, 5, 10, 30 or 60 seconds; default 10). Unticking

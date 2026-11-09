@@ -1072,3 +1072,267 @@ SOUNDS = {  # (frequency Hz, start s, length s) notes; synthesized, so nothing t
     "hof": [(1047, 0.0, 0.22), (1319, 0.11, 0.22), (1568, 0.22, 0.22), (2093, 0.33, 0.6)],
     "problem": [(440, 0.0, 0.28), (349, 0.22, 0.42)],
 }
+
+
+# ---------------- account-wide safety limits ----------------
+LIMIT_DEFAULTS = {"max_open": 10, "loss_streak": 5, "streak_pause": 30.0}  # (the limit per ticker already existed)
+
+LIMIT_SETTINGS = (  # (key, explanation, type) for the Settings window, shown after the daily loss limit
+    ("max_open", "Most open positions: the account never holds more than this many positions at once, whatever the bots "
+                 "say (0 = no limit)", int),
+    ("loss_streak", "Losing-streak pause: after this many losing trades in a row, open nothing new for a while "
+                    "(0 = off). Sells and safety exits still happen", int),
+    ("streak_pause", "How long the losing-streak pause lasts, in minutes", float),
+)
+
+
+def book_ticker(c):
+    """The ticker a book trades ('SPY~scalp' -> 'SPY')."""
+    return str(c).split("~")[0]
+
+
+class FarmAppMixin:
+    """App behaviour shared by CBBF, OBF and SBF: account-wide safety limits and the farm doctor. It relies on the
+    attributes every app has (settings, pos, position_price, equity, tourn, running, cfg, root, write, ...)."""
+
+    # ---- limits ----
+    def limit_block(self, c, spend):
+        """Why the account may not open (or add to) `c` for `spend` right now, or None. Checked before every new
+        position, whatever the bots say; sells and safety exits are never blocked."""
+        s = self.settings
+        st = self.__dict__.setdefault("lim_state", dict(n=0, until=0.0))
+        now = time.time()
+        if st.get("until", 0) > now:
+            return f"losing-streak pause ({int((st['until'] - now) // 60) + 1} min left)"
+        held = [k for k, q in self.pos.items() if q > 0]
+        mo = int(s.get("max_open", 0) or 0)
+        if mo > 0 and c not in held and len(held) >= mo:
+            return f"already {len(held)} open positions (the most you allow is {mo})"
+        return None
+
+    def limit_blocked(self, c, spend):
+        """limit_block, saying why in the log at most once every 10 minutes per reason. -> True when blocked."""
+        why = self.limit_block(c, spend)
+        if not why:
+            return False
+        seen = self.__dict__.setdefault("_lim_said", {})
+        key = why.split(" (")[0]
+        if time.time() - seen.get(key, 0) > 600:
+            seen[key] = time.time()
+            self.write(f"Safety limit: not opening {book_ticker(c)}: {why}. Change it in Settings > Safety limits.", "warn")
+        return True
+
+    def limit_note_close(self, pl):
+        """Counts a finished trade toward the losing-streak pause."""
+        if pl is None:
+            return
+        st = self.__dict__.setdefault("lim_state", dict(n=0, until=0.0))
+        if pl < 0:
+            st["n"] = st.get("n", 0) + 1
+        else:
+            st["n"] = 0
+        k = int(self.settings.get("loss_streak", 0) or 0)
+        if k > 0 and st["n"] >= k:
+            mins = float(self.settings.get("streak_pause", 30) or 30)
+            st["until"], st["n"] = time.time() + mins * 60, 0
+            self.write(f"Safety limit: {k} losing trades in a row, so nothing new opens for {mins:g} minutes. "
+                       "Open positions keep their stops and exits.", "warn")
+
+    # ---- the farm doctor ----
+    def doctor_findings(self):
+        """Health checks on the farm and the app: [dict(key, level 'bad'|'warn'|'info', title, text, fix, fix_label)]."""
+        out = []
+        add = lambda key, level, title, text, fix=None, label=None: out.append(
+            dict(key=key, level=level, title=title, text=text, fix=fix, fix_label=label))
+        s, t, now = self.settings, getattr(self, "tourn", None), time.time()
+        running = bool(getattr(self, "running", False))
+        mkt = getattr(self, "market", None)
+        market_open = True if not isinstance(mkt, dict) else bool(mkt.get("is_open", True))
+        if t is not None and getattr(t, "vars", None):
+            cap = int(s.get("max_bots", t.cap) or t.cap)
+            n = len(t.vars)
+            if n > cap * 1.1 + 1:
+                add("overfull", "bad", f"The farm has {n} bots; its size is {cap}",
+                    "A farm far past its size runs slower and judges its bots more slowly.", "trim", f"Trim to {cap}")
+            unscored = [v for v in t.vars if t.score(v) is None]
+            stuck = [v for v in unscored if not t.young(v)]
+            if t.n > 300 and len(unscored) > 0.6 * n:
+                add("warming", "warn", f"{len(unscored)} of {n} bots can't be judged yet",
+                    (f"{len(stuck)} of them have had a full window and still hardly trade; they make room first when "
+                     "new eggs come. " if stuck else "Most are new eggs: keep the farm running and they'll get scored. ")
+                    + "If this lasts for days, new eggs may be arriving faster than bots can be judged.")
+            kinds = {}
+            for v in t.vars:
+                kinds[v.name] = kinds.get(v.name, 0) + 1
+            top, k = max(kinds.items(), key=lambda x: x[1])
+            if n >= 10 and k > 0.7 * n:
+                add("monoculture", "info", f"{k} of {n} bots share one strategy",
+                    "The farm has little to fall back on if that strategy stops working. Backup strategies are kept "
+                    "alive automatically; a fresh egg or two of other kinds can help.")
+            if running and s.get("proven_only", True) and hasattr(t, "proven_bots"):
+                if t.proven_bots():
+                    self.__dict__["_doc_np_since"] = None
+                else:
+                    since = self.__dict__.get("_doc_np_since") or now
+                    self.__dict__["_doc_np_since"] = since
+                    hrs = (now - since) / 3600
+                    if hrs >= 2:
+                        add("unproven", "warn", f"No bot has been proven for {hrs:.0f} hours",
+                            "Only proven bots trade the account, so it's standing still. Free roam's exams and a running "
+                            "farm are how bots get proven.", "training", "How to train them")
+            examined = [v for v in t.vars if getattr(v, "exams", None)]
+            if t.n > 1000 and len(examined) < 0.2 * n and s.get("proven_exam", True):
+                add("exams", "info", f"Only {len(examined)} of {n} bots have taken an exam",
+                    "Bots need exams on days they never trained on to be proven. Free roam gives the most.",
+                    None if self.cfg.get("roam_on") else "roam_on", None if self.cfg.get("roam_on") else "Turn on Free roam")
+        last = getattr(self, "last_tick", None)
+        if running and market_open and last is not None:
+            age = (datetime.now() - last).total_seconds()
+            if age > 300:
+                add("stale", "bad", f"No new prices for {int(age // 60)} minutes",
+                    "The bots can't decide without prices. Check your internet connection; the app keeps reconnecting.",
+                    "reconnect", "Reconnect now")
+        if self.cfg.get("roam_on") and getattr(self, "_roam_last", 0):
+            idle = now - self._roam_last
+            err = getattr(self, "roam_err", None)
+            if err:
+                add("roam_err", "warn", "Free roam hit a problem", str(err)[:300], "roam_restart", "Restart Free roam")
+            elif idle > 45 * 60 and t is not None:
+                add("roam_idle", "warn", f"Free roam hasn't studied anything for {int(idle // 60)} minutes",
+                    "It may be waiting for history it can't download, or for a login.", "roam_restart", "Restart Free roam")
+        errs = int(getattr(self, "err_count", 0) or 0)
+        if errs >= 5:
+            add("errors", "warn", f"{errs} errors this run",
+                "Something keeps going wrong. A report shows what it is.", "export", "Export a report for Claude")
+        from datetime import date as _date
+        if getattr(self, "halted_day", None) == _date.today():
+            add("dayloss", "info", "Today's loss limit was reached",
+                "The account opens nothing new until tomorrow (your daily loss limit). Open positions keep their exits.")
+        st = self.__dict__.get("lim_state") or {}
+        if st.get("until", 0) > now:
+            add("streak", "info", "Paused after a losing streak",
+                f"Nothing new opens for {int((st['until'] - now) // 60) + 1} more minutes.", "resume", "Resume now")
+        return out
+
+    def doctor_fix(self, key):
+        t = getattr(self, "tourn", None)
+        if key == "trim" and t is not None:
+            t.cap = int(self.settings.get("max_bots", t.cap))
+            gone = t.trim_to_cap()
+            self.write(f"Farm doctor: {gone} bots made room, so the farm is back to its size of {t.cap}.", "good")
+            try:
+                self.save_farm()
+            except Exception:
+                pass
+        elif key == "roam_on":
+            self.toggle_roam(True)
+        elif key == "roam_restart":
+            self.roam_err = None
+            self.toggle_roam(False)
+            self.root.after(1500, lambda: self.toggle_roam(True))
+        elif key == "training" and hasattr(self, "show_training_help"):
+            self.show_training_help()
+        elif key == "export":
+            self.export_report()
+        elif key == "reconnect" and getattr(self, "worker_args", None):
+            self.write("Farm doctor: reconnecting the price feed.", "warn")
+            self.launch_worker()
+        elif key == "resume":
+            self.__dict__.setdefault("lim_state", {})["until"] = 0.0
+            self.write("Losing-streak pause lifted.", "good")
+        self.doctor_tick(reschedule=False)
+
+    def _doctor_colors(self):
+        import sys
+        g = vars(sys.modules[type(self).__module__])
+        return {k: g.get(k, d) for k, d in (("BG", "#111827"), ("CARD", "#1f2937"), ("TEXT", "#e5e7eb"),
+                                              ("MUTED", "#9ca3af"), ("GREEN", "#22c55e"), ("RED", "#ef4444"),
+                                              ("LINE", "#374151"), ("ACCENT", "#3b82f6"))}
+
+    def build_doctor_button(self, header):
+        import tkinter as tk
+        c = self._doctor_colors()
+        self.doc_btn = tk.Button(header, text="✚ Doctor", command=self.open_doctor, relief="flat", bd=0, padx=10,
+                                 pady=3, cursor="hand2", font=("", 9, "bold"), bg=c["LINE"], fg=c["TEXT"],
+                                 activebackground=c["LINE"])
+        self.doc_btn.pack(side="right", padx=(0, 8))
+        self.root.after(20000, self.doctor_tick)
+
+    def doctor_tick(self, reschedule=True):
+        """Every minute: run the checks, colour the Doctor button, and say so once when something serious appears."""
+        try:
+            if getattr(self, "doc_btn", None) is None or not self.doc_btn.winfo_exists():
+                return
+            found = self.doctor_findings()
+            c = self._doctor_colors()
+            bad = [f for f in found if f["level"] == "bad"]
+            warn = [f for f in found if f["level"] == "warn"]
+            amber = "#f59e0b"
+            if bad or warn:
+                self.doc_btn.config(text=f"✚ Doctor ({len(bad) + len(warn)})", bg=c["RED"] if bad else amber,
+                                    fg="white", activebackground=c["RED"] if bad else amber)
+            else:
+                self.doc_btn.config(text="✚ Doctor", bg=c["LINE"], fg=c["TEXT"], activebackground=c["LINE"])
+            said = self.__dict__.setdefault("_doc_said", set())
+            for f in bad + warn:
+                if f["key"] not in said:
+                    said.add(f["key"])
+                    self.write(f"Farm doctor: {f['title']}. {f['text']} (click Doctor at the top)", "warn")
+            said &= {f["key"] for f in found}
+            win = getattr(self, "_doc_win", None)
+            if win is not None and win.winfo_exists():
+                self._fill_doctor(found)
+        except Exception:
+            try:
+                import sys
+                sys.modules["engine"].note_error("doctor_tick")
+            except Exception:
+                pass
+        finally:
+            if reschedule and not self.closing():
+                self.root.after(60000, self.doctor_tick)
+
+    def open_doctor(self):
+        import tkinter as tk
+        c = self._doctor_colors()
+        w = getattr(self, "_doc_win", None)
+        if w is not None and w.winfo_exists():
+            w.lift()
+            return self._fill_doctor(self.doctor_findings())
+        w = self._doc_win = tk.Toplevel(self.root)
+        w.title("Farm doctor")
+        w.configure(bg=c["BG"])
+        w.geometry("640x460")
+        tk.Label(w, text="✚ Farm doctor", bg=c["BG"], fg=c["TEXT"], font=("", 13, "bold")).pack(anchor="w", padx=14,
+                                                                                                    pady=(12, 0))
+        tk.Label(w, text="Checks the farm and the app every minute, and offers a fix where there is one.", bg=c["BG"],
+                 fg=c["MUTED"]).pack(anchor="w", padx=14)
+        self._doc_body = tk.Frame(w, bg=c["BG"])
+        self._doc_body.pack(fill="both", expand=True, padx=14, pady=10)
+        tk.Button(w, text="Check again", command=lambda: self._fill_doctor(self.doctor_findings()), relief="flat",
+                  bg=c["LINE"], fg=c["TEXT"], padx=10, pady=3).pack(anchor="e", padx=14, pady=(0, 12))
+        self._fill_doctor(self.doctor_findings())
+
+    def _fill_doctor(self, found):
+        import tkinter as tk
+        c = self._doctor_colors()
+        body = self._doc_body
+        for ch in body.winfo_children():
+            ch.destroy()
+        if not found:
+            tk.Label(body, text="✓ Everything looks healthy.", bg=c["BG"], fg=c["GREEN"],
+                     font=("", 11, "bold")).pack(anchor="w", pady=8)
+            return
+        dot = {"bad": c["RED"], "warn": "#f59e0b", "info": c["ACCENT"]}
+        for f in sorted(found, key=lambda f: ("bad", "warn", "info").index(f["level"])):
+            card = tk.Frame(body, bg=c["CARD"], padx=10, pady=8)
+            card.pack(fill="x", pady=4)
+            top = tk.Frame(card, bg=c["CARD"])
+            top.pack(fill="x")
+            tk.Label(top, text="●", bg=c["CARD"], fg=dot[f["level"]]).pack(side="left")
+            tk.Label(top, text=f["title"], bg=c["CARD"], fg=c["TEXT"], font=("", 10, "bold")).pack(side="left", padx=4)
+            if f.get("fix"):
+                tk.Button(top, text=f["fix_label"] or "Fix", command=lambda k=f["fix"]: self.doctor_fix(k), relief="flat",
+                          bg=c["ACCENT"], fg="white", padx=8, pady=1, cursor="hand2").pack(side="right")
+            tk.Label(card, text=f["text"], bg=c["CARD"], fg=c["MUTED"], wraplength=560, justify="left",
+                     anchor="w").pack(fill="x", pady=(3, 0))

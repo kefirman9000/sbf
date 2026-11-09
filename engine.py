@@ -24,6 +24,7 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 
 from farmcore import (  # noqa: F401  shared with the other bot farm apps (see farmcore.py)
+    LIMIT_DEFAULTS,
     BAR_CHOICES, BIG_EVENTS, BOT_FORMAT_VERSION, CANDLE_GRANS, CLASSICS, COLLECT_FIELDS, CTX_KEY, DISK_T0,
     DISK_WRITES, EVENT_KINDS, EXAM_KEEP, EXAM_MIN, FEATURE_CLEAR, FEATURE_KEEP, FEATURE_LEAN, FEATURE_MIN,
     FEATURE_SKIP, FEATURE_VERDICT_TEXT, HTF_MULTS, LOOKBACK, MAX_BOT_FILE, MAX_CTX, MAX_VETOES, MEMORY_FIELDS, MOODS,
@@ -1319,6 +1320,9 @@ STYLES = {  # risk presets: trade size, stop / target on the share price, daily 
     "Balanced": dict(trade_pct=10.0, stop_loss=5.0, take_profit=10.0, daily_loss=5.0, max_coin_pct=30.0),
     "Adventurous": dict(trade_pct=15.0, stop_loss=8.0, take_profit=20.0, daily_loss=10.0, max_coin_pct=45.0),
 }
+
+
+DEFAULT_SETTINGS.update(LIMIT_DEFAULTS)  # account-wide safety limits (farmcore)
 
 
 def merge_settings(saved):
