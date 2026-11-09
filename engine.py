@@ -1895,6 +1895,7 @@ def tournament_opts(settings):
                 adapt_exits=bool(settings.get("adapt_exits", True)), mut_memory=bool(settings.get("mut_memory", True)),
                 proven_only=bool(settings.get("proven_only", True)), keep_veterans=bool(settings.get("keep_veterans", True)), keep_variety=bool(settings.get("keep_variety", True)), proven_exam=bool(settings.get("proven_exam", True)),
                 proven_trades=int(settings.get("proven_trades", 8) or 0),
+                standin_n=int(settings.get("standin_n", 3) or 0), standin_size=float(settings.get("standin_size", 0.5) or 0.5),
                 prem=list(PREM_RANGE), cfee=CONTRACT_FEE[0], sspread=_set_scalp_spread(settings))
 
 
@@ -3713,6 +3714,12 @@ class Tournament(FarmMixin):
         gate = bool(self.o.get("proven_only", True))
         # proven only: just the winning bots with a real track record decide (shaky ones never do)
         active = [v for v in self.active if keep(v) and self.proven(v)]
+        standin = False
+        if gate and not active:
+            # nobody is proven yet: the best few winners stand in, at a smaller size, until one is
+            active = self.standins(keep)
+            standin = bool(active)
+        self.standin_on = standin
         slowed = [] if gate else [v for v in self.slowed if keep(v)]
         self.kind[key] = None
         bw = sw = bs = ss = 0.0
@@ -3757,8 +3764,8 @@ class Tournament(FarmMixin):
                 self.add_cool[key] = self.o["add_every"]
                 self.kind[key] = "add"
                 avg = sum(self.info[id(v)]["weight"] * self.info[id(v)]["stake"] for v in holders) / hw
-                return "buy", 0.5 * avg
-        return sig, mult
+                return "buy", 0.5 * avg * (float(self.o.get("standin_size", 0.5) or 0.5) if standin else 1.0)
+        return sig, (mult * float(self.o.get("standin_size", 0.5) or 0.5) if standin and sig else mult)
 
 
     def _board(self):
