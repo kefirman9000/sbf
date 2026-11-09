@@ -2,6 +2,19 @@
 
 
 
+
+## 1.7.0
+- **Studies on their own processor cores.** Training camps, Auto camp, Free roam's studies, hindsight and backtests now
+  run in separate worker processes, so they use other cores instead of sharing one with the window. Stopping them
+  and their progress bars work as before, and if a worker can't start, the study simply runs inside SBF as it used
+  to. Settings > Studies on their own cores (on). (The farm's own decisions were measured too: about 6 ms per
+  decision even with 175 bots, so they stay where they are.)
+- **Fix: double-clicking SBF.pyw could open a second copy of the app** in the background whenever a study ran on
+  another core (the scalp scan did this already); the launcher now only starts the app itself.
+- **One shared farm engine.** 39 farm methods that were identical in CBBF, OBF and SBF (ranking, farm size, families,
+  replays, seasons, health...) now live once in farmcore.py, about 360 lines per app, so a fix there reaches all
+  three apps.
+
 ## 1.6.0
 - **Practice learns what real fills cost.** With 'Both' on, every practice trade is also placed on Alpaca paper. SBF now
   compares the two prices and, after 10 priced copies, practice charges the difference on buys and sells, so practice

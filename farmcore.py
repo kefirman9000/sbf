@@ -8,6 +8,7 @@ import json
 import math
 import threading
 import os
+import pickle
 import re
 import shutil
 import time
@@ -1075,7 +1076,8 @@ SOUNDS = {  # (frequency Hz, start s, length s) notes; synthesized, so nothing t
 
 
 # ---------------- account-wide safety limits ----------------
-LIMIT_DEFAULTS = {"max_open": 10, "loss_streak": 5, "streak_pause": 30.0, "fill_learn": True, "earnings_guard": 1}  # (the limit per ticker already existed)
+LIMIT_DEFAULTS = {"max_open": 10, "loss_streak": 5, "streak_pause": 30.0, "fill_learn": True, "earnings_guard": 1,
+                  "study_cores": True}  # (the limit per ticker already existed)
 
 LIMIT_SETTINGS = (  # (key, explanation, type) for the Settings window, shown after the daily loss limit
     ("max_open", "Most open positions: the account never holds more than this many positions at once, whatever the bots "
@@ -1644,3 +1646,521 @@ def earnings_text(sym, ts=None):
         return None
     d = datetime.fromtimestamp(nx)
     return f"{book_ticker(sym)} reports earnings {d:%a %b %d} " + ("before the open" if d.hour < 12 else "after the close")
+
+
+# ---------------- heavy studies on their own processor core ----------------
+def _core_state(mod):
+    """The engine's settings-like globals (UPPERCASE plain data), so a study in another process sees what this one
+    sees (prices learned, contract limits, the data folder...). Logins are never copied."""
+    out = {}
+    for k, v in vars(mod).items():
+        if not k.isupper() or k.startswith("_") or any(w in k for w in ("ALPACA", "KEY", "SECRET", "TOKEN", "IB_")):
+            continue
+        if isinstance(v, (dict, list, tuple, int, float, str, bool)) and not callable(v):
+            try:
+                pickle.dumps(v)
+            except Exception:  # tables holding functions (rule texts...) are the same in every process anyway
+                continue
+            out[k] = v
+    return out
+
+
+def _core_call(modname, fn, state, args, kw, ev, q):
+    import importlib
+    mod = importlib.import_module(modname)
+    for k, v in state.items():
+        cur = getattr(mod, k, None)
+        if isinstance(cur, dict) and isinstance(v, dict):
+            cur.clear()
+            cur.update(v)
+        else:
+            setattr(mod, k, v)
+    if ev is not None:
+        kw["stop"] = ev.is_set
+    if q is not None:
+        kw["progress"] = lambda *a: q.put(a)
+    return getattr(mod, fn)(*args, **kw)
+
+
+class CoreRunner:
+    """Runs heavy studies (training camps, Free roam's studies, hindsight, backtests) in worker processes, so they
+    use other processor cores and the window stays smooth: in the app's own process they'd compete with the screen
+    for the same core. A `stop` callback and a `progress` callback still work (through a small helper process).
+    If a worker can't be used (or the switch is off), the study simply runs here as before."""
+
+    def __init__(self, modname="engine", workers=2, enabled=lambda: True):
+        self.modname, self.workers, self.enabled = modname, workers, enabled
+        self._ex = self._mgr = None
+        self._lock = threading.Lock()
+        self.used = self.fallbacks = 0
+
+    def _pool(self):
+        with self._lock:
+            if self._ex is None:
+                import concurrent.futures as cf
+                import multiprocessing as mp
+                ctx = mp.get_context("spawn")
+                self._ex = cf.ProcessPoolExecutor(max_workers=self.workers, mp_context=ctx)
+                self._mgr = ctx.Manager()
+            return self._ex, self._mgr
+
+    def call(self, fn, *args, stop=None, progress=None, **kw):
+        import sys
+        mod = sys.modules[self.modname]
+        if not self.enabled() or kw.get("on_trade") is not None:
+            return fn(*args, stop=stop, progress=progress, **kw) if (stop or progress) else fn(*args, **kw)
+        try:
+            ex, mgr = self._pool()
+            ev = mgr.Event() if stop else None
+            q = mgr.Queue() if progress else None
+            fut = ex.submit(_core_call, self.modname, fn.__name__, _core_state(mod), args, kw, ev, q)
+        except Exception:
+            self.fallbacks += 1
+            self.shutdown()
+            return fn(*args, stop=stop, progress=progress, **kw) if (stop or progress) else fn(*args, **kw)
+        self.used += 1
+        import concurrent.futures as cf
+        while True:
+            try:
+                return fut.result(timeout=0.25)
+            except cf.TimeoutError:
+                pass
+            except cf.process.BrokenProcessPool:
+                self.fallbacks += 1
+                self.shutdown()
+                return fn(*args, stop=stop, progress=progress, **kw) if (stop or progress) else fn(*args, **kw)
+            if stop is not None and ev is not None and not ev.is_set():
+                try:
+                    if stop():
+                        ev.set()
+                except Exception:
+                    pass
+            while q is not None:
+                try:
+                    item = q.get_nowait()
+                except Exception:
+                    break
+                try:
+                    progress(*item)
+                except Exception:
+                    pass
+
+    def shutdown(self):
+        with self._lock:
+            ex, mgr, self._ex, self._mgr = self._ex, self._mgr, None, None
+        if ex is not None:  # a study still running would otherwise hold up closing the app: end it
+            try:
+                procs = list((getattr(ex, "_processes", None) or {}).values())
+                ex.shutdown(wait=False, cancel_futures=True)
+                for p in procs:
+                    p.terminate()
+            except Exception:
+                pass
+        if mgr is not None:
+            try:
+                mgr.shutdown()
+            except Exception:
+                pass
+
+
+# ---------------- the farm's own bookkeeping, identical in every app ----------------
+class FarmMixin:
+    """Tournament methods that are the same in CBBF, OBF and SBF (ranking, sizes, families, replays, seasons...).
+    Each app's Tournament inherits them, so a fix here reaches all three."""
+
+    def window_for(self, tf):
+        """How many bars a bot is judged over: slow bots get a longer window so they make enough decisions in it."""
+        return self.W * min(max(1, clamp_tf(tf) // 2), 10)
+
+    def mut_bias(self, kind):
+        """Mutation memory: how much more (or less) often this kind of change has produced winners than average
+        (0.5 to 2). 1 when off or with too little evidence."""
+        if not self.o.get("mut_memory", True):
+            return 1.0
+        st = self.mut_stats.get(kind)
+        tb = sum(x[0] for x in self.mut_stats.values())
+        if not st or st[0] < 8 or tb < 30:
+            return 1.0
+        avg = (sum(x[1] for x in self.mut_stats.values()) + 1) / (tb + 2)
+        return min(2.0, max(0.5, ((st[1] + 1) / (st[0] + 2)) / avg))
+
+    def review_pick(self, pool):
+        """Post-trade review: a new never-rule is more likely to be one that would have stopped recent losing buys."""
+        if not self.o.get("post_review", True) or not self.review:
+            return self.rng.choice(pool)
+        w = [(self.review.get(k, [0, 0])[0] + 1) / (self.review.get(k, [0, 0])[1] + 1) for k in pool]
+        return self.rng.choices(pool, weights=w)[0]
+
+    def rand_ctx(self):
+        sym = self.rng.choice(self.ctx_syms)
+        if self.rng.random() < 0.4:
+            return dict(self._rand_sub(), sym=sym, kind="study", sign=self.rng.choice((1, -1)))
+        return dict(sym=sym, kind="move", sign=self.rng.choice((1, -1)), lb=self.rng.randint(2, 30),
+                    th=round(self.rng.uniform(0.2, 3.0), 2))
+
+    def _register(self, v, parents, origin):
+        """Gives a bot its id and family-tree entry."""
+        self.serial += 1
+        v.uid, v.parents, v.origin = self.serial, [p.uid for p in parents], origin
+        v.royal = origin in ("hall of fame", "library", "team", "collection", "saved", "bred from your bots", "designed") or \
+            any(getattr(p, "royal", False) for p in parents)
+        v.gen = 1 + max((p.gen for p in parents), default=-1) if parents else 0
+        k_isl = int(self.o.get("islands", 1) or 1)
+        if parents:
+            v.island = parents[0].island
+        elif k_isl > 1 and self.vars:  # newcomers join the smallest island
+            sizes = [sum(1 for x in self.vars if x.island == i) for i in range(k_isl)]
+            v.island = sizes.index(min(sizes))
+        if parents:
+            p0 = parents[0]
+            kinds = [k for k, same in (("pace", v.tf == p0.tf), ("stops", v.risk == p0.risk), ("traits", v.traits == p0.traits),
+                                       ("rules", v.vetoes == p0.vetoes), ("studies", v.layers == p0.layers),
+                                       ("settings", v.params == p0.params)) if not same]
+            if len(parents) > 1:
+                kinds.append("crossbreed")
+            v.mut_kinds = kinds
+            for k in kinds:
+                self.mut_stats.setdefault(k, [0, 0])[0] += 1
+        self.births.append(self.n)
+        self.lineage[v.uid] = dict(uid=v.uid, label=v.label, name=v.name, tf=v.tf, parents=list(v.parents),
+                                   gen=v.gen, origin=origin, born=self.n, died=None, why="", ret=None, inducted=False)
+
+    def mutate_tf(self, tf):
+        """Usually keep the parent's pace; sometimes move one step faster or slower."""
+        i = TIMEFRAMES.index(clamp_tf(tf))
+        if self.rng.random() < min(0.8, 0.4 * self.mut_bias("pace")):
+            i = min(max(i + self.rng.choice((-1, 1)), 0), len(TIMEFRAMES) - 1)
+        return TIMEFRAMES[i]
+
+    def hold_over(self, k):
+        """What just holding the coins (equal weight) returned over the last k decisions, or None."""
+        hc = self.hold_curve
+        return hc[-1] / hc[-1 - k] - 1 if len(hc) > k else None
+
+    def warmup(self, closes, start=WARM, progress=None, extra=None):
+        L = min(len(closes[c]) for c in self.coins)
+        for i in range(start, L):
+            self.step({c: View(closes[c], i + 1) for c in self.coins}, slice_extra(extra, i + 1))
+            if progress and (i - start) % 50 == 0:
+                progress(i - start, L - start)
+
+    @property
+    def prove_n(self):
+        """Decisions on fresh prices a bot needs before it may be followed as a winner."""
+        return max(10, self.W // 4)
+
+    def sortino(self, v):
+        """Average gain per decision divided by the typical size of its losing decisions (higher = steadier)."""
+        eq = list(v.eq)
+        rets = [eq[i] / eq[i - 1] - 1 for i in range(1, len(eq)) if eq[i - 1] > 0]
+        if len(rets) < 10:
+            return 0.0
+        mean = sum(rets) / len(rets)
+        down = (sum(min(r, 0) ** 2 for r in rets) / len(rets)) ** 0.5
+        if down <= 1e-12:
+            return 5.0 if mean > 0 else 0.0
+        return max(0.0, mean / down * (len(rets) ** 0.5) / 3)
+
+    def drawdown(self, v):
+        """How far the variant's equity sits below its recent peak (0..1)."""
+        eq = list(v.eq)
+        peak = max(eq) if eq else 0
+        return (peak - eq[-1]) / peak if peak > 0 else 0.0
+
+    def mood_fit(self, v, mood=None):
+        """Average gain per decision while `mood` ruled, or None with too little evidence."""
+        mood = mood or self.mood
+        k = v.mood_n.get(mood, 0)
+        return v.mood_gain.get(mood, 0.0) / k if k >= 30 else None
+
+    def best_mood(self, v):
+        fits = [(self.mood_fit(v, m), m) for m in MOODS]
+        fits = [x for x in fits if x[0] is not None]
+        return max(fits)[1] if fits and max(fits)[0] > 0 else None
+
+    def health(self, v):
+        """0..1: how the bot is doing right now. Falls with drawdown from its recent best; never-rules that keep
+        saving money add a little, rules that keep blocking winners take some away. Very low health = it rests."""
+        h = 1.0 - self.drawdown(v) * 8 if v.eq else 1.0
+        bonus = 0.0
+        for k in v.vetoes:
+            st = v.veto_stats.get(k)
+            if st and st[0] >= 3:
+                bonus += max(-0.15, min(0.1, st[1] / st[0] / 20))
+        return max(0.0, min(1.0, h + bonus))
+
+    def update_power(self, v, edge):
+        """Power grows only from real money made on fresh prices (not replays) while beating just holding, and
+        fades slowly otherwise. It raises the bot's trade-size ceiling, its say in votes and its breeding odds."""
+        if self.replaying or not v.eq:
+            return
+        e = v.eq[-1]
+        if v.live_high is None:
+            v.live_high = e
+        if e > v.live_high and (edge is None or edge > 0):
+            v.power = min(10.0, v.power + (e / v.live_high - 1) * 40)  # a slow, earned climb
+            v.live_high = e
+        elif e < v.live_high * 0.98:
+            v.power = max(0.0, v.power - 0.02)
+
+    def life(self, v):
+        """Lifetime track record since the bot was created."""
+        ret = v.eq[-1] / v.sim.start - 1 if v.eq and v.sim.start else 0.0
+        hold = None
+        if v.born_px and self.last_px:
+            r = [self.last_px[c] / v.born_px[c] for c in self.coins if v.born_px.get(c) and c in self.last_px]
+            hold = sum(r) / len(r) - 1 if r else None
+        closed = v.wins + v.losses
+        return dict(ret=ret, hold=hold, edge=None if hold is None else ret - hold, trades=v.ntrades,
+                    wins=v.wins, losses=v.losses, winrate=v.wins / closed if closed else None,
+                    maxdd=v.maxdd, age=v.age, win_steps=v.win_steps, streak=v.streak, best_mood=self.best_mood(v),
+                    fees=v.sim.fees)
+
+    def young(self, v):
+        """Still within its first window of decisions: too new to judge, so never dropped to make room."""
+        return self.score(v) is None and v.age < self.window_for(v.tf)
+
+    def weakest(self):
+        """Who goes first when room is needed, as (bot, score) pairs: bots that have had a full window and still
+        can't be scored (they hardly trade) first, then the scored ones from the bottom of the ranking. Bots too young
+        to judge are left alone, so new eggs get their chance and the farm doesn't fill with unjudged eggs, and so are
+        contenders for a vote (see protected)."""
+        keep = self.protected()
+        stuck = sorted((v for v in self.vars if self.score(v) is None and not self.young(v) and id(v) not in keep),
+                       key=lambda v: len(v.sim.tbars))
+        out = [(v, None) for v in stuck] + [(v, x) for v, x in reversed(self.ranking()) if id(v) not in keep]
+        if self.o.get("keep_variety", True):  # the last two of a strategy family go last: backups for other markets
+            fam = {}
+            for v in self.vars:
+                fam[v.name] = fam.get(v.name, 0) + 1
+            out = [x for x in out if fam[x[0].name] > 2] + [x for x in out if fam[x[0].name] <= 2]
+        return out
+
+    def trim_to_cap(self):
+        """Brings an overfull farm back down to its size (bots that can't be judged, then the weakest). -> removed"""
+        n = 0
+        while len(self.vars) > self.cap:
+            cands = [x for x, _ in self.weakest() if x not in self.active]
+            if not cands:
+                break
+            self._remove(cands[0], "farm over its size")
+            n += 1
+        return n
+
+    def nursery_full(self):
+        """True when too many bots are still too young to judge (40% of the farm): extra eggs then wait."""
+        return sum(1 for v in self.vars if self.young(v)) >= 0.4 * max(1, self.cap)
+
+    def drivers(self):
+        return list(self.active)
+
+    def summary(self):
+        """(number of active winners, best variant or None, any variant scored yet)"""
+        scored = any(d["score"] is not None for d in self.info.values())
+        return len(self.active), (self.active[0] if self.active else None), scored
+
+    @staticmethod
+    def _holding(v, c):
+        return v.sim.pos.get(c, 0) > 0
+
+    def proven_bots(self):
+        return [v for v in self.vars if self.proven(v)]
+
+    def board(self):
+        """Rows for the scoreboard / farm. Cached until the ratings change, so drawing never recomputes it."""
+        key = (id(self.info), self.n, len(self.vars))
+        if getattr(self, "_board_key", None) == key:
+            return self._board_rows
+        self._board_rows = self._board()
+        self._board_key = key
+        return self._board_rows
+
+    def crossover(self, name, a, b):
+        """Child settings: each setting taken from one parent or the other, then lightly tweaked."""
+        mix = {k: (a[k] if self.rng.random() < 0.5 else b.get(k, a[k])) for k in a}
+        return self.mutate(name, mix, scale=0.1)
+
+    def replay(self, v, closes):
+        L = min(len(closes[c]) for c in self.coins)
+        m = min(v.eq.maxlen, L - WARM)
+        rec, self.recording = self.recording, False  # replayed history is not a new trade
+        self.replaying = True
+        try:
+            x = self.xfull if self.xfull and all(len((self.xfull.get(c) or {}).get("h", ())) == len(closes[c])
+                                                 for c in self.coins) else None
+            for j in range(m):
+                i = L - m + j
+                self._run(v, {c: View(closes[c], i + 1) for c in self.coins}, self.n - (m - 1 - j),
+                          extra=slice_extra(x, i + 1) if x else {})
+        finally:
+            self.recording = rec
+            self.replaying = False
+
+    def drop_twins(self):
+        """Exact copies on the same island (identical settings, rules and layers, from migration, training camps or
+        starter sets) waste farm places and vote twice for the same idea. The best-scoring copy stays."""
+        groups = {}
+        for v in self.vars:
+            groups.setdefault((getattr(v, "island", 0), v.key()), []).append(v)
+        gone = 0
+        for vs in groups.values():
+            if len(vs) < 2:
+                continue
+            vs.sort(key=lambda x: (self.score(x) is not None, self.score(x) or 0.0, -x.uid), reverse=True)
+            for v in vs[1:]:
+                if v in self.vars:
+                    self._remove(v, "exact copy of another bot")
+                    gone += 1
+        if gone:
+            self.events.append(f"Removed {gone} exact cop{'y' if gone == 1 else 'ies'} of other bots (the best copy stays)")
+        return gone
+
+    def seasons_tick(self, closes):
+        """Keeps a champion per market mood. When the mood changes, the new season's champion is woken up
+        (hatched again from its genes) if it's no longer on the farm."""
+        for v in self.vars:
+            for m in MOODS:
+                fit = self.mood_fit(v, m)
+                if fit is not None and fit > 0 and fit > self.champions.get(m, {}).get("fit", 0):
+                    self.champions[m] = dict(name=v.name, params=dict(v.params), tf=v.tf, risk=dict(v.risk),
+                                             traits=dict(v.traits), vetoes=dict(v.vetoes),
+                                             layers=json.loads(json.dumps(v.layers)), fit=fit, uid=v.uid,
+                                             label=v.label)
+        mood = self.mood
+        if mood == "unknown" or mood == self.season:
+            self._season_cand = None
+            return
+        # a new season only starts once the new mood has held for a while (no flicker)
+        cand = getattr(self, "_season_cand", None)
+        if not cand or cand[0] != mood:
+            self._season_cand = (mood, self.n)
+            if self.season is not None:
+                return
+        elif self.n - cand[1] < max(20, self.evolve_every * 2):
+            return
+        old, self.season = self.season, mood
+        self.seasons_log.append((self.n, mood))
+        del self.seasons_log[:-50]
+        if old is None:
+            return
+        ch = self.champions.get(mood)
+        if not ch:
+            self.events.append(f"Season change: {mood}. No champion for it yet")
+            return
+        if any(x.uid == ch["uid"] for x in self.vars):
+            self.events.append(f"Season change: {mood}. Its champion {ch['label']} is already on the farm")
+            return
+        v = self.add_variant(ch["name"], ch["params"], closes, note=f"Season change: {mood}. Woke its champion",
+                             tf=ch["tf"], origin="season champion", risk=ch["risk"], traits=ch["traits"],
+                             vetoes=ch["vetoes"], layers=ch["layers"])
+        if v:
+            ch["uid"] = v.uid
+            if len(self.vars) > self.cap:
+                cands = [x for x, _ in self.weakest() if x not in self.active and x is not v]
+                if cands:
+                    self._remove(cands[0], "dropped to make room")
+
+    def _spawn_or_random(self, closes):
+        before = len(self.vars)
+        self._spawn(closes)
+        if len(self.vars) == before and len(self.vars) < self.cap:
+            self.spawn_random(closes)
+
+    def _rotate(self, closes):
+        """Replaces bots that have gone retire_steps decisions without winning (losing, or never trading)."""
+        loosen_silent(self)  # silent bots first lose a gate and get another window (farmcore)
+        gone = []
+        for v in self.vars:
+            st = self.info.get(id(v), {}).get("status")
+            v.bad = 0 if st in ("active", "slowed", "standby") else getattr(v, "bad", 0) + 1
+            if v.bad >= self.retire_steps and len(self.vars) - len(gone) > 8:
+                gone.append(v)
+        for v in gone:
+            self._remove(v, "rotated out (not winning for a long time)")
+            self.events.append(f"Rotated out {v.label} (not winning for a long time)")
+        for _ in gone:
+            self._spawn_or_random(closes)
+        if gone:
+            self._rate()
+
+    def dominant(self):
+        """The strategy family that fills more than half of the farm, or None."""
+        if len(self.vars) < 12:
+            return None
+        fam = {}
+        for v in self.vars:
+            fam[v.name] = fam.get(v.name, 0) + 1
+        name, n = max(fam.items(), key=lambda x: x[1])
+        return name if n / len(self.vars) > 0.5 else None
+
+    def spawn_classic(self, closes=None):
+        """Hatches one famous strategy that isn't on the farm yet (silver egg). None if all are already here."""
+        have = {v.classic for v in self.vars}
+        pool = [c for c in CLASSICS if c["title"] not in have]
+        if not pool:
+            return None
+        cl = self.rng.choice(pool)
+        v = self.add_variant(cl["name"], dict(cl["params"]), closes, note=f"Classic strategy hatched: {cl['title']}:",
+                             tf=cl.get("tf", 1), origin="classic", risk=cl.get("risk"), traits=cl.get("traits"))
+        if v:
+            v.classic = cl["title"]
+        return v
+
+    def hall_of_fame_candidates(self, min_win_steps, min_trades):
+        """Bots that have earned a place: enough time Winning, enough finished trades, and ahead of
+        both zero and just holding over their whole life."""
+        out = []
+        for v in self.vars:
+            if v.inducted or v.win_steps < min_win_steps:
+                continue
+            lf = self.life(v)
+            if (v.wins + v.losses) >= min_trades and lf["ret"] > 0 and (lf["edge"] is None or lf["edge"] > 0):
+                out.append(v)
+        return out
+
+    def export_lineup(self):
+        """Strategies worth keeping (everything not stopped), as plain data for saving."""
+        keep = [v for v in self.vars if self.info.get(id(v), {}).get("status") != "benched"] or list(self.vars)
+        return [dict(name=v.name, params=dict(v.params), size=v.size_mult, tf=v.tf, risk=dict(v.risk), traits=dict(v.traits))
+                for v in keep]
+
+    def family(self):
+        """Family-tree records for living and recently removed bots, with live stats for the living."""
+        alive = {v.uid: v for v in self.vars}
+        out = []
+        for uid, rec in self.lineage.items():
+            r = dict(rec)
+            v = alive.get(uid)
+            if v:
+                r.update(label=v.label, alive=True, status=self.info.get(id(v), {}).get("status", "warming up"),
+                         ret=v.eq[-1] / v.sim.start - 1 if v.eq else None, inducted=v.inducted)
+            else:
+                r.update(alive=False, status=rec["why"] or "removed")
+            out.append(r)
+        return out
+
+    def pop_shadow(self):
+        s, self.shadow = self.shadow, []
+        return s
+
+    def pop_events(self):
+        e, self.events = self.events, []
+        return e
+
+    def align_coins(self, coins, last=None):
+        """Makes the farm trade exactly these coins (a safety net if they ever get out of step with the session).
+        Positions in dropped coins are closed at their last price. Returns the new coin list."""
+        last = dict(self.last_px, **(last or {}))
+        gone = [c for c in self.coins if c not in coins]
+        for v in self.vars:
+            for c in gone:
+                q = v.sim.pos.get(c, 0)
+                if q > 0 and last.get(c):
+                    v.sim.sell(c, last[c])
+                v.sim.pos.pop(c, None)
+                v.sim.cost.pop(c, None)
+                v.sim.last = None
+            if v.born_px:
+                v.born_px = {c: x for c, x in v.born_px.items() if c in coins}
+        self.coins = list(coins)
+        return self.coins
