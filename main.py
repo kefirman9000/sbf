@@ -61,7 +61,7 @@ from datetime import date, datetime, timedelta
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import engine as E
-from farmcore import NAV_SETTINGS, CoreRunner, FarmAppMixin, NavMixin, FillCheckMixin, LIMIT_SETTINGS, FILL_SETTINGS, EARN_SETTINGS, earnings_loop  # safety limits and the farm doctor, shared by the apps
+from farmcore import NAV_SETTINGS, STANDIN_SETTINGS, CoreRunner, FarmAppMixin, NavMixin, FillCheckMixin, LIMIT_SETTINGS, FILL_SETTINGS, EARN_SETTINGS, earnings_loop  # safety limits and the farm doctor, shared by the apps
 import broker as B
 
 # ---- Update settings: change to your GitHub "user/repo" after publishing ----
@@ -162,6 +162,7 @@ SETTING_GROUPS = [
         ("proven_only", "Only proven bots trade the account (practice, Alpaca paper and LIVE): a bot needs a real track "
                         "record first. Every other bot keeps training on its own pretend money", bool),
         ("proven_trades", "...finished trades a bot needs before it may trade the account", int),
+        *STANDIN_SETTINGS,
         ("proven_exam", "...and it must have passed its exams (Free roam tests it on days it never trained on)", bool),
         ("winner_boost", "Biggest trade size a top winner can earn (1 = normal, 2.5 = 2.5 times)", float),
         ("slow_every", "Shaky strategies may only trade every N decisions", int),
@@ -9555,6 +9556,12 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
                 msg = (f"The account follows {len(leading)} proven winner{'s' if len(leading) != 1 else ''} "
                        f"({len(proven)} proven in all). Best lifetime record: {E.bot_nickname(best.key())} "
                        f"({t.life(best)['ret'] * 100:+.1f}% since it hatched).")
+            elif t.standins():
+                si = t.standins()
+                msg = (("No proven bot is winning right now" if proven else f"No bot is proven yet ({need})")
+                       + f", so the {len(si)} best winner{'s' if len(si) != 1 else ''} stand in at "
+                       f"{float(self.settings.get('standin_size', 0.5) or 0.5) * 100:.0f}% of the normal size: "
+                       + ", ".join(E.bot_nickname(v.key()) for v in si) + ".")
             elif proven:
                 msg = (f"{len(proven)} bot{'s are' if len(proven) != 1 else ' is'} proven, but none is winning right now, "
                        "so the account waits.")

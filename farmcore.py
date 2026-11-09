@@ -1077,7 +1077,7 @@ SOUNDS = {  # (frequency Hz, start s, length s) notes; synthesized, so nothing t
 
 # ---------------- account-wide safety limits ----------------
 LIMIT_DEFAULTS = {"max_open": 10, "loss_streak": 5, "streak_pause": 30.0, "fill_learn": True, "earnings_guard": 1,
-                  "study_cores": True, "rail_nav": True}  # (the limit per ticker already existed)
+                  "study_cores": True, "rail_nav": True, "standin_n": 3, "standin_size": 0.5}  # (the limit per ticker already existed)
 
 LIMIT_SETTINGS = (  # (key, explanation, type) for the Settings window, shown after the daily loss limit
     ("max_open", "Most open positions: the account never holds more than this many positions at once, whatever the bots "
@@ -1085,6 +1085,11 @@ LIMIT_SETTINGS = (  # (key, explanation, type) for the Settings window, shown af
     ("loss_streak", "Losing-streak pause: after this many losing trades in a row, open nothing new for a while "
                     "(0 = off). Sells and safety exits still happen", int),
     ("streak_pause", "How long the losing-streak pause lasts, in minutes", float),
+)
+STANDIN_SETTINGS = (
+    ("standin_n", "...while no bot is proven, the best few bots may trade the account anyway, at a smaller size: how "
+                  "many (0 = off, the account waits for a proven bot)", int),
+    ("standin_size", "...their trade size, as a share of the normal size (0.5 = half)", float),
 )
 NAV_SETTINGS = (
     ("rail_nav", "New layout: Home plus Trading, Bots, Learning and Markets on a rail at the left (off = the old row of "
@@ -1196,10 +1201,12 @@ class FarmAppMixin:  # (FillCheckMixin, defined below, joins it in apps with Alp
                     since = self.__dict__.get("_doc_np_since") or now
                     self.__dict__["_doc_np_since"] = since
                     hrs = (now - since) / 3600
+                    si = t.standins() if hasattr(t, "standins") else []
                     if hrs >= 2:
-                        add("unproven", "warn", f"No bot has been proven for {hrs:.0f} hours",
-                            "Only proven bots trade the account, so it's standing still. Free roam's exams and a running "
-                            "farm are how bots get proven.", "training", "How to train them")
+                        add("unproven", "info" if si else "warn", f"No bot has been proven for {hrs:.0f} hours",
+                            (f"Until one is, the {len(si)} best winners trade the account at a smaller size. " if si else
+                             "Only proven bots trade the account, so it's standing still. ")
+                            + "Free roam's exams and a running farm are how bots get proven.", "training", "How to train them")
             examined = [v for v in t.vars if getattr(v, "exams", None)]
             if t.n > 1000 and len(examined) < 0.2 * n and s.get("proven_exam", True):
                 add("exams", "info", f"Only {len(examined)} of {n} bots have taken an exam",
@@ -1931,6 +1938,23 @@ class FarmMixin:
                     maxdd=v.maxdd, age=v.age, win_steps=v.win_steps, streak=v.streak, best_mood=self.best_mood(v),
                     fees=v.sim.fees)
 
+    def standins(self, keep=lambda v: True):
+        """While no bot is proven: the best few winning bots that may trade the account in the meantime (at a smaller
+        size). Each must be winning now, have 3+ finished trades, be ahead over its life and not have failed its exams;
+        kamikazes never stand in. -> [bots], best lifetime record first."""
+        n = int(self.o.get("standin_n", 0) or 0)
+        if n <= 0:
+            return []
+        out = []
+        for v in self.active:
+            if not keep(v) or (getattr(v, "traits", None) or {}).get("kami") or (v.wins + v.losses) < 3:
+                continue
+            lf = self.life(v)
+            if lf["ret"] <= 0 or exam_verdict(v, getattr(self, "serial", 100))[0] == "failed":
+                continue
+            out.append((lf["ret"], v))
+        return [v for _, v in sorted(out, key=lambda x: -x[0])[:n]]
+
     def young(self, v):
         """Still within its first window of decisions: too new to judge, so never dropped to make room."""
         return self.score(v) is None and v.age < self.window_for(v.tf)
@@ -2403,6 +2427,9 @@ class NavMixin:
             if rk:
                 v, sc = rk[0]
                 lbl(body, f"Leading: {bot_nickname(v.key())} ({v.name}) {sc * 100:+.1f}%")
+            si = t.standins() if not pv and hasattr(t, "standins") else []
+            if si:
+                lbl(body, "Standing in at a smaller size: " + ", ".join(bot_nickname(v.key()) for v in si), "#f59e0b")
             if not pv and hasattr(t, "proven_gaps"):
                 near = sorted(((len(g), v, g) for v in t.vars for g in [t.proven_gaps(v)] if g), key=lambda x: x[0])[:1]
                 for _, v, g in near:

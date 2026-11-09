@@ -5,6 +5,15 @@
 
 
 
+
+## 1.9.0
+- **Stand-ins while no bot is proven.** Until a proven bot is winning, the account no longer just waits: the 3 best
+  winners trade it at half the normal size. Each must be winning right now, have 3+ finished trades, be ahead over
+  its whole life and not have failed its exams; kamikazes never stand in. As soon as a proven bot is winning, it
+  takes over and the stand-ins step back. The bar under the top line, the farm's status line and Home name the
+  stand-ins. Settings (under "Only proven bots trade the account"): how many may stand in (0 = off, the old
+  behaviour) and their size (0.5 = half).
+
 ## 1.8.0
 - **A new layout: Home, plus four sections on a rail at the left.**
   - **Home** answers three questions at a glance: *Is it running?* (with Start / Stop), *Is anyone proven?* (the
