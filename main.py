@@ -13183,7 +13183,10 @@ class App(FarmAppMixin):
                             stats = None
                     if prices or stats:
                         self.q.put(("watch", (prices, stats)))
-                except Exception:
+                except Exception as e:
+                    if isinstance(e, getattr(E, "NeedLogin", ())) or getattr(e, "code", None) in (401, 403):
+                        time.sleep(30)  # not logged in (or the key was rejected): wait quietly, it's not an error
+                        continue
                     E.note_error("loop")
                 time.sleep(20 if self._iconic else 5)
         self._watch_thread = threading.Thread(target=loop, daemon=True)

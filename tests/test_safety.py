@@ -90,3 +90,33 @@ def test_doctor_warming_stale_and_healthy():
     a.last_tick = datetime.now()
     a.running = False
     assert a.doctor_findings() == []
+
+
+def test_silent_bot_loses_a_gate_and_gets_a_fresh_window():
+    from farmcore import loosen_gate, loosen_silent
+
+    class Sim:
+        tbars = []
+
+    class V:
+        def __init__(self):
+            self.traits, self.layers, self.vetoes = {"minvol": 0.8, "confirm": 3}, {"need": 2, "plus": [{}]}, {}
+            self.sim, self.age, self.tf, self.label, self.origin = Sim(), 900, 1, "bot", "bred"
+
+    class T:
+        n, events = 20, []
+
+        def __init__(self):
+            self.vars = [V()]
+
+        def window_for(self, tf):
+            return 100
+
+    t = T()
+    assert loosen_silent(t) == 1
+    v = t.vars[0]
+    assert "minvol" not in v.traits and v.age == 0 and v.loosened == 1 and "Loosened" in t.events[-1]
+    assert loosen_silent(t) == 0  # young again: it gets a whole window first
+    v.age = 900
+    seen = [loosen_gate(v) for _ in range(5)]
+    assert seen[-1] is None and v.traits == {} and v.layers.get("need") == 1 and not v.layers.get("plus")

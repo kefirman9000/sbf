@@ -1336,3 +1336,72 @@ class FarmAppMixin:
                           bg=c["ACCENT"], fg="white", padx=8, pady=1, cursor="hand2").pack(side="right")
             tk.Label(card, text=f["text"], bg=c["CARD"], fg=c["MUTED"], wraplength=560, justify="left",
                      anchor="w").pack(fill="x", pady=(3, 0))
+
+
+# ---------------- silent bots: loosen a gate instead of waiting for them to be dropped ----------------
+LOOSEN_MAX = 4  # gates a bot may lose this way
+
+
+def loosen_gate(v):
+    """Drops the most restrictive entry gate a bot has (it went a whole window without trading). -> what it dropped,
+    or None when it has nothing left to loosen. Its genes change, so it's a slightly different bot from here on."""
+    tr, ly, ve = v.traits, v.layers if v.layers is not None else {}, v.vetoes if v.vetoes is not None else {}
+    if tr.get("minvol"):  # the commonest silencer: on short candles most bars move less than it asks for
+        tr.pop("minvol")
+        return "skipping quiet markets"
+    if tr.get("moods"):
+        tr.pop("moods")
+        return "trading only in some kinds of market"
+    if tr.get("confirm"):
+        tr.pop("confirm")
+        return "waiting for several signals in a row"
+    if ly.get("htf"):
+        ly.pop("htf")
+        return "waiting for the bigger trend to agree"
+    if int(ly.get("need", 1) or 1) > 1:
+        ly["need"] = int(ly["need"]) - 1
+        return "one of the studies that had to agree before it bought"
+    if tr.get("trend"):
+        tr.pop("trend")
+        return "buying only above its long-term trend line"
+    if ly.get("plus"):
+        ly["plus"] = list(ly["plus"])[:-1]
+        return "one of its extra reasons it needed before buying"
+    if ve:
+        k = sorted(ve)[0]
+        ve.pop(k)
+        return f"its never-rule '{k}'"
+    if ly.get("minus"):
+        ly["minus"] = list(ly["minus"])[:-1]
+        return "one of its reasons not to buy"
+    if tr.get("rsicap"):
+        tr.pop("rsicap")
+        return "its 'too high to buy' limit"
+    if tr.get("cool"):
+        tr.pop("cool")
+        return "its wait after selling"
+    return None
+
+
+def loosen_silent(t, every=10):
+    """Bots that went a whole scoring window without a single trade can't be judged or learn anything; often they
+    simply carry too many conditions before buying. Each gets up to LOOSEN_MAX of them removed, one per silent window,
+    and a fresh window to show what it does (instead of just being dropped to make room)."""
+    if t.n % every:
+        return 0
+    k = 0
+    for v in list(t.vars):
+        if getattr(v, "origin", "") == "team" or (v.traits or {}).get("kami") or v.sim.tbars:
+            continue
+        if v.age < t.window_for(v.tf) or getattr(v, "loosened", 0) >= LOOSEN_MAX:
+            continue
+        what = loosen_gate(v)
+        if not what:
+            v.loosened = LOOSEN_MAX
+            continue
+        v.loosened = getattr(v, "loosened", 0) + 1
+        v._key = None
+        v.age = 0  # a fresh window to be judged in
+        k += 1
+        t.events.append(f"Loosened {v.label}: dropped {what} (no trades in a whole window)")
+    return k

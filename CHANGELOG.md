@@ -11,6 +11,14 @@
   **Most open positions** (default 10), and a **Losing-streak pause** (after 5 losing trades in a row, nothing new
   opens for 30 minutes). Sells and safety exits are never blocked. Together with the daily loss limit and the limit
   per ticker you already had.
+- **Silent bots get loosened instead of just dropped.** Your reports showed farms where most bots never traded
+  (100 of 120 on one): they carried so many conditions before buying (skip quiet markets, only some kinds of market,
+  several signals in a row, the bigger trend agreeing...) that the moment never came, so they could never be judged
+  or learn. A bot that goes a whole scoring window without a trade now loses its most restrictive condition and gets
+  a fresh window, up to 4 times. In a test farm built like yours, bots stuck without trades went from 35 to 0 and
+  more bots could be judged (29 instead of 23).
+- **Fix: "not logged in" no longer fills the error log.** The price watcher logged an error every few seconds while
+  you weren't logged in (26 of the last 27 errors in one report); it now just waits.
 - **Fix: an overfull saved farm now really shrinks back to its size when it loads.** Loading stretched the size to
   fit every bot, so the trim did nothing and a 60-bot farm could stay at 125.
 

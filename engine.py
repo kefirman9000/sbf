@@ -24,6 +24,7 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 
 from farmcore import (  # noqa: F401  shared with the other bot farm apps (see farmcore.py)
+    loosen_silent,
     LIMIT_DEFAULTS,
     BAR_CHOICES, BIG_EVENTS, BOT_FORMAT_VERSION, CANDLE_GRANS, CLASSICS, COLLECT_FIELDS, CTX_KEY, DISK_T0,
     DISK_WRITES, EVENT_KINDS, EXAM_KEEP, EXAM_MIN, FEATURE_CLEAR, FEATURE_KEEP, FEATURE_LEAN, FEATURE_MIN,
@@ -4186,6 +4187,7 @@ class Tournament:
 
     def _rotate(self, closes):
         """Replaces bots that have gone retire_steps decisions without winning (losing, or never trading)."""
+        loosen_silent(self)  # silent bots first lose a gate and get another window (farmcore)
         gone = []
         for v in self.vars:
             st = self.info.get(id(v), {}).get("status")
