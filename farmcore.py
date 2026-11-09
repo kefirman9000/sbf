@@ -1704,11 +1704,22 @@ class CoreRunner:
                 self._mgr = ctx.Manager()
             return self._ex, self._mgr
 
+    @staticmethod
+    def _direct_kw(kw, stop, progress):
+        """The keyword arguments for running a study here: only the callbacks that were given (backtests take no
+        `stop`, for example)."""
+        out = dict(kw)
+        if stop is not None:
+            out["stop"] = stop
+        if progress is not None:
+            out["progress"] = progress
+        return out
+
     def call(self, fn, *args, stop=None, progress=None, **kw):
         import sys
         mod = sys.modules[self.modname]
         if not self.enabled() or kw.get("on_trade") is not None:
-            return fn(*args, stop=stop, progress=progress, **kw) if (stop or progress) else fn(*args, **kw)
+            return fn(*args, **self._direct_kw(kw, stop, progress))
         try:
             ex, mgr = self._pool()
             ev = mgr.Event() if stop else None
@@ -1717,7 +1728,7 @@ class CoreRunner:
         except Exception:
             self.fallbacks += 1
             self.shutdown()
-            return fn(*args, stop=stop, progress=progress, **kw) if (stop or progress) else fn(*args, **kw)
+            return fn(*args, **self._direct_kw(kw, stop, progress))
         self.used += 1
         import concurrent.futures as cf
         while True:
@@ -1728,7 +1739,7 @@ class CoreRunner:
             except cf.process.BrokenProcessPool:
                 self.fallbacks += 1
                 self.shutdown()
-                return fn(*args, stop=stop, progress=progress, **kw) if (stop or progress) else fn(*args, **kw)
+                return fn(*args, **self._direct_kw(kw, stop, progress))
             if stop is not None and ev is not None and not ev.is_set():
                 try:
                     if stop():
