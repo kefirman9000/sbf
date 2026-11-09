@@ -174,3 +174,20 @@ def test_earnings_calendar_guard_and_rule(tmp_path, monkeypatch):
     assert "earnings" in a.limit_block("AAPL", 10)
     a.settings["earnings_guard"] = 0
     assert a.limit_block("AAPL", 10) is None
+
+
+def test_core_runner_runs_here_without_extra_arguments():
+    from farmcore import CoreRunner
+
+    def study(x, progress=None, on_trade=None):  # takes no `stop`, like backtest_bot
+        if progress:
+            progress(1, 2)
+        return x * 2
+
+    seen = []
+    r = CoreRunner(enabled=lambda: False)
+    assert r.call(study, 4) == 8
+    assert r.call(study, 4, progress=lambda *a: seen.append(a)) == 8 and seen == [(1, 2)]
+    on = CoreRunner()  # a callback that can't cross processes (on_trade) keeps the study here, as it is
+    assert on.call(study, 5, progress=lambda *a: None, on_trade=lambda *a: None) == 10
+    on.shutdown()

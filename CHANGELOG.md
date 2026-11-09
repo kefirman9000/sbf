@@ -3,6 +3,12 @@
 
 
 
+
+## 1.7.1
+- **Fix: Free roam's self-tests failed** ("backtest_bot() got an unexpected keyword argument 'stop'"). A study that
+  stays in the app (because it reports each trade to the Free roam screen) was handed a stop option backtests don't
+  take. It now gets only the options it was given.
+
 ## 1.7.0
 - **Studies on their own processor cores.** Training camps, Auto camp, Free roam's studies, hindsight and backtests now
   run in separate worker processes, so they use other cores instead of sharing one with the window. Stopping them
