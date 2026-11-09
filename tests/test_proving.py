@@ -62,4 +62,5 @@ def test_protection_is_capped_so_the_farm_keeps_evolving():
     for v in t.vars:
         if v.origin != "team" and not getattr(v, "traits", {}).get("kami"):
             make_contender(t, v)
-    assert len(t.protected()) <= max(1, t.cap // 3)
+    # contenders take at most a third; proven veterans (8+ trades, ahead for life) can add up to a sixth more
+    assert len(t.protected()) <= max(1, t.cap // 3) + max(1, t.cap // 6)

@@ -24,6 +24,7 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 
 from farmcore import (  # noqa: F401  shared with the other bot farm apps (see farmcore.py)
+    earn_days_ahead,
     loosen_silent,
     LIMIT_DEFAULTS,
     BAR_CHOICES, BIG_EVENTS, BOT_FORMAT_VERSION, CANDLE_GRANS, CLASSICS, COLLECT_FIELDS, CTX_KEY, DISK_T0,
@@ -2018,6 +2019,8 @@ VETOES = {
                     text=lambda x: f"never buys in the last {int(x)} minutes before the 4 pm close (New York)"),
     "panic":   dict(lo=0.5, hi=5.0, side="sell", name="No panic selling",
                     text=lambda x: f"never sells on its strategy right after a {x:g}%+ one-bar drop (stops still work)"),
+    "earnings": dict(lo=1, hi=5, side="open", name="Stays away from earnings",
+                     text=lambda x: f"never buys {int(x)} trading day{'s' if int(x) > 1 else ''} or less before an earnings report"),
     "gap":     dict(lo=0.3, hi=4.0, side="open", name="No gap days",
                     text=lambda x: f"never buys on a day that opened {x:g}%+ away from the day before's close"),
     "weekday": dict(lo=1, hi=5, side="open", name="Skips one weekday",
@@ -2042,7 +2045,7 @@ def clean_vetoes(d):
             x = 0
         if x > 0 and len(out) < MAX_VETOES:
             x = min(max(x, spec["lo"]), spec["hi"])
-            out[k] = int(round(x)) if k in ("revenge", "opening", "closing", "weekday", "newsday") else round(x, 2)
+            out[k] = int(round(x)) if k in ("revenge", "opening", "closing", "weekday", "newsday", "earnings") else round(x, 2)
     return out
 
 
@@ -2102,6 +2105,9 @@ def _veto(v, k, x, c, closes, n, extra, coins):
         return bool(moves) and sum(moves) / len(moves) * 100 <= -x
     if k == "panic":
         return (p[-1] / p[-2] - 1) * 100 <= -x
+    if k == "earnings":  # (from the earnings calendar; with none downloaded it never blocks)
+        dd = earn_days_ahead(c, _bar_time(extra, c, v.sim))
+        return dd is not None and dd <= int(x)
     if k == "gap":
         g = day_gap(c, p, ((extra or {}).get(c) or {}).get("t"))
         return g is not None and abs(g) >= x
