@@ -1,5 +1,27 @@
 # Changelog
 
+
+## 1.5.0
+- **Farm doctor** (top bar, next to Essentials only): checks the farm and the app every minute and offers a fix
+  where there is one: a farm far past its size (one click trims it), most bots unjudged, no bot proven for hours,
+  few exams, prices that stopped coming, Free roam stuck or idle, errors piling up, one strategy taking over, and
+  today's loss limit or a losing-streak pause. The button turns amber or red when something needs you, and says
+  so once in the log.
+- **Safety limits for the account**, enforced whatever the bots decide (Settings, after the daily loss limit):
+  **Most open positions** (default 10), and a **Losing-streak pause** (after 5 losing trades in a row, nothing new
+  opens for 30 minutes). Sells and safety exits are never blocked. Together with the daily loss limit and the limit
+  per ticker you already had.
+- **Silent bots get loosened instead of just dropped.** Your reports showed farms where most bots never traded
+  (100 of 120 on one): they carried so many conditions before buying (skip quiet markets, only some kinds of market,
+  several signals in a row, the bigger trend agreeing...) that the moment never came, so they could never be judged
+  or learn. A bot that goes a whole scoring window without a trade now loses its most restrictive condition and gets
+  a fresh window, up to 4 times. In a test farm built like yours, bots stuck without trades went from 35 to 0 and
+  more bots could be judged (29 instead of 23).
+- **Fix: "not logged in" no longer fills the error log.** The price watcher logged an error every few seconds while
+  you weren't logged in (26 of the last 27 errors in one report); it now just waits.
+- **Fix: an overfull saved farm now really shrinks back to its size when it loads.** Loading stretched the size to
+  fit every bot, so the trim did nothing and a 60-bot farm could stay at 125.
+
 ## 1.4.1
 - Training camp Auto: **Stop now works while it waits** between camps (it cancels the next one), the wait shows a
   countdown, and a **wait** choice sets the pause between camps (0, 5, 10, 30 or 60 seconds; default 10). Unticking
