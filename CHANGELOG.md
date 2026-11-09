@@ -4,6 +4,20 @@
 
 
 
+
+## 1.8.0
+- **A new layout: Home, plus four sections on a rail at the left.**
+  - **Home** answers three questions at a glance: *Is it running?* (with Start / Stop), *Is anyone proven?* (the
+    leading bot, and what the closest one still needs) and *What needs you?* (the farm doctor's findings, with their
+    fix buttons). Below: your latest trades and what's learning right now.
+  - **Trading**: Portfolio, Options, Trades, Alpaca account. **Bots**: Bot Farm, Slow farm, Scalpers, Success, Bot
+    positions, and the Library & Hall of Fame. **Learning**: the Overview of every feature, plus Free roam, the
+    Training camp and Farm knowledge. **Markets**.
+  - Each section shows its screens as buttons along the top. The account panel and the charts stay in Home, Trading
+    and Markets; Bots and Learning get the whole window.
+  - Nothing was removed: every tab, button and window is where its section says. Links that jump to a tab (like
+    'See the bots') move the rail along. Settings > New layout (off) brings the old row of tabs back after a restart.
+
 ## 1.7.1
 - **Fix: Free roam's self-tests failed** ("backtest_bot() got an unexpected keyword argument 'stop'"). A study that
   stays in the app (because it reports each trade to the Free roam screen) was handed a stop option backtests don't

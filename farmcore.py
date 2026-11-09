@@ -1077,7 +1077,7 @@ SOUNDS = {  # (frequency Hz, start s, length s) notes; synthesized, so nothing t
 
 # ---------------- account-wide safety limits ----------------
 LIMIT_DEFAULTS = {"max_open": 10, "loss_streak": 5, "streak_pause": 30.0, "fill_learn": True, "earnings_guard": 1,
-                  "study_cores": True}  # (the limit per ticker already existed)
+                  "study_cores": True, "rail_nav": True}  # (the limit per ticker already existed)
 
 LIMIT_SETTINGS = (  # (key, explanation, type) for the Settings window, shown after the daily loss limit
     ("max_open", "Most open positions: the account never holds more than this many positions at once, whatever the bots "
@@ -1085,6 +1085,10 @@ LIMIT_SETTINGS = (  # (key, explanation, type) for the Settings window, shown af
     ("loss_streak", "Losing-streak pause: after this many losing trades in a row, open nothing new for a while "
                     "(0 = off). Sells and safety exits still happen", int),
     ("streak_pause", "How long the losing-streak pause lasts, in minutes", float),
+)
+NAV_SETTINGS = (
+    ("rail_nav", "New layout: Home plus Trading, Bots, Learning and Markets on a rail at the left (off = the old row of "
+                 "tabs). Takes effect the next time the app starts", bool),
 )
 EARN_SETTINGS = (
     ("earnings_guard", "Earnings guard: the account opens nothing in a stock this many trading days before it reports "
@@ -2175,3 +2179,289 @@ class FarmMixin:
                 v.born_px = {c: x for c, x in v.born_px.items() if c in coins}
         self.coins = list(coins)
         return self.coins
+
+
+# ---------------- the layout: a rail of five sections over the app's tabs ----------------
+NAV_SECTIONS = (  # section -> the tabs it holds (matched by name), then windows it opens: (label, method)
+    ("Home", ("Home",), ()),
+    ("Trading", ("Portfolio", "Options", "Trades", "Alpaca account"), ()),
+    ("Bots", ("Bot Farm", "Slow farm", "Scalpers", "Success", "Bot positions"),
+     (("Library & Hall of Fame...", "open_collection"),)),
+    ("Learning", ("Overview",), (("Free roam...", "open_roam"), ("Training camp...", "open_training"),
+                                 ("Farm knowledge...", "open_knowledge"))),
+    ("Markets", ("Markets",), ()),
+)
+NAV_WIDE = ("Home", "Trading", "Markets")  # sections that keep the account panel and the charts
+
+
+class NavMixin:
+    """Home plus four sections on a left rail (Trading, Bots, Learning, Markets). The app's tabs stay as they are; the
+    rail picks which ones show, as pills along the top. Settings > Classic layout brings the old tab row back."""
+
+    def build_nav(self):
+        import tkinter as tk
+        from tkinter import ttk
+        if not self.settings.get("rail_nav", True):
+            return
+        c = self._doctor_colors()
+        nb, split = self.nb, self.split
+        self._nav_right = split.master
+        body = self._nav_right.master
+        st = ttk.Style()
+        st.layout("Rail.TNotebook.Tab", [])  # the notebook's own tab row is replaced by the rail and the pills
+        st.configure("Rail.TNotebook", borderwidth=0, tabmargins=0)
+        nb.configure(style="Rail.TNotebook")
+        home = self._home = tk.Frame(nb, bg=c["BG"])
+        nb.insert(0, home, text="  ⌂ Home  ")
+        self._build_home(home)
+        rail = self._rail = tk.Frame(body, bg=c["CARD"], width=150)
+        first = body.pack_slaves()[0] if body.pack_slaves() else None
+        rail.pack(side="left", fill="y", padx=(0, 10), before=first)
+        self._nav_btns = {}
+        for name, _, _ in NAV_SECTIONS:
+            b = tk.Button(rail, text=name, anchor="w", relief="flat", bd=0, padx=16, pady=10, cursor="hand2",
+                          font=("", 10, "bold"), command=lambda n=name: self.nav_go(n))
+            b.pack(fill="x", padx=6, pady=(6 if name == "Home" else 2, 0))
+            self._nav_btns[name] = b
+        self._pills = tk.Frame(nb.master, bg=c["BG"])
+        self._pills.pack(fill="x", pady=(6, 0), before=nb)
+        nb.bind("<<NotebookTabChanged>>", lambda e: self._nav_sync(), add="+")
+        self._nav_sec = None
+        self.nav_go("Home")
+        self.root.after(3000, self._home_tick)
+
+    def _nav_tab_ids(self, names):
+        out = []
+        for want in names:
+            for t_ in self.nb.tabs():
+                if want.lower() in self.nb.tab(t_, "text").lower() and t_ not in out:
+                    out.append(t_)
+        return out
+
+    def _section_of(self, tab_id):
+        for name, tabs, _ in NAV_SECTIONS:
+            if tab_id in self._nav_tab_ids(tabs):
+                return name
+        return "Trading"  # anything not listed (an app's own extra tab) lives with the trading screens
+
+    def nav_go(self, name, tab=None):
+        """Shows one section: its first tab (or `tab`), its pills, and the account panel and charts where they belong."""
+        ids = self._nav_tab_ids(dict((n, t) for n, t, _ in NAV_SECTIONS)[name])
+        if name == "Trading":
+            known = {t for _, tabs, _ in NAV_SECTIONS for t in self._nav_tab_ids(tabs)}
+            ids += [t for t in self.nb.tabs() if t not in known]
+        target = tab if tab in ids else (getattr(self, "_nav_last", {}).get(name) if getattr(self, "_nav_last", {}).get(name) in ids else (ids[0] if ids else None))
+        self._nav_sec = name
+        if target is not None and self.nb.select() != target:
+            self.nb.select(target)
+        self._nav_layout(name)
+        self._nav_paint(name, ids)
+
+    def _nav_sync(self):
+        """A tab chosen some other way (a button, a link, the keyboard): the rail follows."""
+        if not getattr(self, "_rail", None):
+            return
+        cur = self.nb.select()
+        name = self._section_of(cur)
+        self.__dict__.setdefault("_nav_last", {})[name] = cur
+        if name != self._nav_sec:
+            self._nav_sec = name
+            self._nav_layout(name)
+        ids = self._nav_tab_ids(dict((n, t) for n, t, _ in NAV_SECTIONS)[name])
+        if name == "Trading":
+            known = {t for _, tabs, _ in NAV_SECTIONS for t in self._nav_tab_ids(tabs)}
+            ids += [t for t in self.nb.tabs() if t not in known]
+        self._nav_paint(name, ids)
+
+    def _nav_layout(self, name):
+        """The account panel and the charts show in Home, Trading and Markets; the other sections get the room."""
+        wide = name in NAV_WIDE
+        left = getattr(self, "left_scroll", None)
+        if left is not None:
+            if wide and not left.winfo_ismapped():
+                left.pack(side="left", fill="y", padx=(0, 10), before=self._nav_right)
+            elif not wide and left.winfo_ismapped():
+                left.pack_forget()
+        cc, split = getattr(self, "chart_card", None), self.split
+        if cc is not None:
+            shown = str(cc) in [str(p) for p in split.panes()]
+            if wide and not shown:
+                split.add(cc, before=self.nb.master, minsize=150, stretch="never",
+                          height=getattr(self, "_chart_h", 250))
+            elif not wide and shown:
+                self._chart_h = max(150, cc.winfo_height())
+                split.forget(cc)
+
+    def _nav_paint(self, name, ids):
+        import tkinter as tk
+        c = self._doctor_colors()
+        for n, b in self._nav_btns.items():
+            on = n == name
+            b.config(bg=c["ACCENT"] if on else c["CARD"], fg="white" if on else c["TEXT"],
+                     activebackground=c["ACCENT"] if on else c["LINE"])
+        for ch in self._pills.winfo_children():
+            ch.destroy()
+        openers = dict((n, o) for n, _, o in NAV_SECTIONS)[name]
+        if name == "Home" or (len(ids) <= 1 and not openers):
+            return
+        cur = self.nb.select()
+        for t_ in ids:
+            on = t_ == cur
+            txt = self.nb.tab(t_, "text").strip()
+            tk.Button(self._pills, text=txt, relief="flat", bd=0, padx=14, pady=5, cursor="hand2", font=("", 9, "bold"),
+                      bg=c["ACCENT"] if on else c["CARD"], fg="white" if on else c["TEXT"],
+                      activebackground=c["LINE"], command=lambda t=t_: self.nav_go(name, t)).pack(side="left", padx=(0, 6))
+        for label, meth in openers:
+            fn = getattr(self, meth, None)
+            if fn is not None:
+                tk.Button(self._pills, text=label, relief="flat", bd=0, padx=12, pady=5, cursor="hand2", font=("", 9),
+                          bg=c["BG"], fg=c["ACCENT"], activebackground=c["LINE"],
+                          command=fn).pack(side="left", padx=(0, 6))
+
+    # ---- Home ----
+    def _build_home(self, f):
+        import tkinter as tk
+        c = self._doctor_colors()
+        f.configure(padx=4, pady=8)
+        row = tk.Frame(f, bg=c["BG"])
+        row.pack(fill="x")
+        self._home_cards = {}
+        for i, (key, title) in enumerate((("run", "IS IT RUNNING?"), ("proven", "IS ANYONE PROVEN?"),
+                                          ("needs", "WHAT NEEDS YOU"))):
+            card = tk.Frame(row, bg=c["CARD"], padx=14, pady=12)
+            card.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 10, 0))
+            row.grid_columnconfigure(i, weight=1, uniform="home")
+            tk.Label(card, text=title, bg=c["CARD"], fg=c["MUTED"], font=("", 8, "bold")).pack(anchor="w")
+            big = tk.Label(card, text="", bg=c["CARD"], fg=c["TEXT"], font=("", 15, "bold"), anchor="w", justify="left")
+            big.pack(anchor="w", fill="x", pady=(2, 0))
+            body = tk.Frame(card, bg=c["CARD"])
+            body.pack(fill="both", expand=True, pady=(4, 0))
+            self._home_cards[key] = (card, big, body)
+        low = tk.Frame(f, bg=c["BG"])
+        low.pack(fill="both", expand=True, pady=(10, 0))
+        self._home_low = {}
+        for i, (key, title) in enumerate((("trades", "Latest trades"), ("learn", "Learning right now"))):
+            card = tk.Frame(low, bg=c["CARD"], padx=14, pady=10)
+            card.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 10, 0))
+            low.grid_columnconfigure(i, weight=1, uniform="low")
+            low.grid_rowconfigure(0, weight=1)
+            tk.Label(card, text=title, bg=c["CARD"], fg=c["TEXT"], font=("", 10, "bold")).pack(anchor="w")
+            body = tk.Frame(card, bg=c["CARD"])
+            body.pack(fill="both", expand=True, pady=(4, 0))
+            self._home_low[key] = body
+        self.refresh_home()
+
+    def _home_tick(self):
+        try:
+            if getattr(self, "_home", None) is not None and self.nb.select() == str(self._home) and not self.in_bg():
+                self.refresh_home()
+        except Exception:
+            pass
+        if not self.closing():
+            self.root.after(3000, self._home_tick)
+
+    def refresh_home(self):
+        import tkinter as tk
+        c = self._doctor_colors()
+        lbl = lambda parent, text, fg=None, bold=False: tk.Label(
+            parent, text=text, bg=c["CARD"], fg=fg or c["TEXT"], anchor="w", justify="left", wraplength=360,
+            font=("", 9, "bold" if bold else "normal")).pack(fill="x", anchor="w")
+
+        def clear(w):
+            for ch in w.winfo_children():
+                ch.destroy()
+        # is it running?
+        _, big, body = self._home_cards["run"]
+        clear(body)
+        running = bool(getattr(self, "running", False))
+        acct = self.acct_name() if hasattr(self, "acct_name") else ""
+        big.config(text=(f"Running · {acct.title()}" if running else "Stopped"), fg=c["GREEN"] if running else c["MUTED"])
+        try:
+            eq = self.equity()
+            day0 = getattr(self, "day_eq", None)
+            d = eq - day0 if day0 else 0.0
+            lbl(body, f"Account ${eq:,.2f} · today {d:+,.2f}", c["GREEN"] if d > 0 else c["RED"] if d < 0 else None)
+        except Exception:
+            pass
+        mkt = getattr(self, "market", None)
+        if isinstance(mkt, dict):
+            lbl(body, "Market open" if mkt.get("is_open") else "Market closed", c["MUTED"])
+        tk.Button(body, text="Stop the bot" if running else "Start the bot", relief="flat", bd=0, padx=12, pady=5,
+                  cursor="hand2", bg=c["RED"] if running else c["GREEN"], fg="white",
+                  command=lambda: self.btn.invoke()).pack(anchor="w", pady=(8, 0))
+        # is anyone proven?
+        _, big, body = self._home_cards["proven"]
+        clear(body)
+        t = getattr(self, "tourn", None)
+        if t is None:
+            big.config(text="No farm yet", fg=c["MUTED"])
+            lbl(body, "Press Start: the farm hatches and starts learning.", c["MUTED"])
+        else:
+            pv = t.proven_bots() if hasattr(t, "proven_bots") else []
+            big.config(text=f"{len(pv)} proven bot{'s' if len(pv) != 1 else ''}", fg=c["GREEN"] if pv else c["TEXT"])
+            rk = t.ranking()
+            if rk:
+                v, sc = rk[0]
+                lbl(body, f"Leading: {bot_nickname(v.key())} ({v.name}) {sc * 100:+.1f}%")
+            if not pv and hasattr(t, "proven_gaps"):
+                near = sorted(((len(g), v, g) for v in t.vars for g in [t.proven_gaps(v)] if g), key=lambda x: x[0])[:1]
+                for _, v, g in near:
+                    lbl(body, f"Closest: {bot_nickname(v.key())} needs {', '.join(g[:2])}", c["MUTED"])
+            lbl(body, f"{len(t.vars)} bots on the farm", c["MUTED"])
+            tk.Button(body, text="See the bots", relief="flat", bd=0, padx=12, pady=5, cursor="hand2", bg=c["LINE"],
+                      fg=c["TEXT"], command=lambda: self.nav_go("Bots")).pack(anchor="w", pady=(8, 0))
+        # what needs you
+        card, big, body = self._home_cards["needs"]
+        clear(body)
+        found = [f for f in self.doctor_findings() if f["level"] in ("bad", "warn")]
+        big.config(text="All good" if not found else f"{len(found)} thing{'s' if len(found) != 1 else ''}",
+                   fg=c["GREEN"] if not found else "#f59e0b")
+        for x in found[:3]:
+            r = tk.Frame(body, bg=c["CARD"])
+            r.pack(fill="x", pady=2)
+            tk.Label(r, text=x["title"], bg=c["CARD"], fg=c["TEXT"], anchor="w", justify="left", wraplength=260,
+                     font=("", 9)).pack(side="left", fill="x", expand=True)
+            if x.get("fix"):
+                tk.Button(r, text=x["fix_label"] or "Fix", relief="flat", bd=0, padx=8, pady=2, cursor="hand2",
+                          bg=c["ACCENT"], fg="white", command=lambda k=x["fix"]: (self.doctor_fix(k), self.refresh_home())
+                          ).pack(side="right")
+        if not found:
+            lbl(body, "The farm doctor checks every minute.", c["MUTED"])
+        # latest trades
+        body = self._home_low["trades"]
+        clear(body)
+        rows = list(getattr(self, "trades", []) or [])[-6:][::-1]
+        if not rows:
+            lbl(body, "No account trades yet. The account only trades when a proven bot says so.", c["MUTED"])
+        for r in rows:
+            pl = r.get("pl")
+            txt = f"{str(r.get('time', ''))[11:16]}  {'Bought' if r.get('side') == 'buy' else 'Sold'} {r.get('coin', '')}"
+            line = tk.Frame(body, bg=c["CARD"])
+            line.pack(fill="x")
+            tk.Label(line, text=txt, bg=c["CARD"], fg=c["TEXT"], anchor="w", font=("", 9)).pack(side="left")
+            if pl not in ("", None):
+                tk.Label(line, text=f"{float(pl):+,.2f}", bg=c["CARD"], fg=c["GREEN"] if float(pl) >= 0 else c["RED"],
+                         font=("", 9, "bold")).pack(side="right")
+        tk.Button(body, text="All trades", relief="flat", bd=0, padx=10, pady=3, cursor="hand2", bg=c["LINE"], fg=c["TEXT"],
+                  command=lambda: self.nav_go("Trading", (self._nav_tab_ids(("Trades",)) or [None])[0])).pack(anchor="w", pady=(6, 0))
+        # learning right now
+        body = self._home_low["learn"]
+        clear(body)
+        on = lambda x: ("On", c["GREEN"]) if x else ("Off", c["MUTED"])
+        items = [("Free roam", self.cfg.get("roam_on")), ("Auto camp", self.cfg.get("auto_camp"))]
+        sl = getattr(self, "slow", None)
+        if isinstance(sl, dict):
+            items.append(("Slow farm", bool(sl.get("t")) and bool(sl.get("on", sl.get("running", False)))))
+        if self.cfg.get("essentials"):
+            lbl(body, "Essentials only is on: nothing learns in the background.", "#f59e0b")
+        for nm, val in items:
+            txt, col = on(val)
+            line = tk.Frame(body, bg=c["CARD"])
+            line.pack(fill="x")
+            tk.Label(line, text=nm, bg=c["CARD"], fg=c["TEXT"], anchor="w", font=("", 9)).pack(side="left")
+            tk.Label(line, text=txt, bg=c["CARD"], fg=col, font=("", 9, "bold")).pack(side="right")
+        now_ = getattr(self, "roam_now", None)
+        if isinstance(now_, dict) and now_.get("text"):
+            lbl(body, now_["text"], c["MUTED"])
+        tk.Button(body, text="Everything in Learning", relief="flat", bd=0, padx=10, pady=3, cursor="hand2", bg=c["LINE"],
+                  fg=c["TEXT"], command=lambda: self.nav_go("Learning")).pack(anchor="w", pady=(6, 0))
