@@ -6,6 +6,9 @@
 
 
 
+## 1.9.1
+- Fixed an error when pressing Bring / Save in the Training camp with no farm running or no bots passed: it now shows the note instead.
+- The farm doctor now warns when Essentials only is on (it blocks Free roam, so no bots get proven).
 ## 1.9.0
 - **Stand-ins while no bot is proven.** Until a proven bot is winning, the account no longer just waits: the 3 best
   winners trade it at half the normal size. Each must be winning right now, have 3+ finished trades, be ahead over
