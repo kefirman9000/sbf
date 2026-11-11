@@ -1207,6 +1207,11 @@ class FarmAppMixin:  # (FillCheckMixin, defined below, joins it in apps with Alp
                             (f"Until one is, the {len(si)} best winners trade the account at a smaller size. " if si else
                              "Only proven bots trade the account, so it's standing still. ")
                             + "Free roam's exams and a running farm are how bots get proven.", "training", "How to train them")
+            if self.cfg.get("essentials") and hasattr(t, "proven_bots") and not t.proven_bots():
+                add("essentials", "warn", "Essentials only is on, so no bot can become proven",
+                    "Free roam, Auto camp, the Slow farm and the Scalp lab are paused, and bots are proven by the exams "
+                    "Free roam gives. Until it's off, only stand-ins (if any) trade the account.", "essentials_off",
+                    "Turn Essentials only off")
             examined = [v for v in t.vars if getattr(v, "exams", None)]
             if t.n > 1000 and len(examined) < 0.2 * n and s.get("proven_exam", True):
                 add("exams", "info", f"Only {len(examined)} of {n} bots have taken an exam",
@@ -1280,6 +1285,8 @@ class FarmAppMixin:  # (FillCheckMixin, defined below, joins it in apps with Alp
         elif key == "reconnect" and getattr(self, "worker_args", None):
             self.write("Farm doctor: reconnecting the price feed.", "warn")
             self.launch_worker()
+        elif key == "essentials_off":
+            self.toggle_essentials(False)
         elif key == "resume":
             self.__dict__.setdefault("lim_state", {})["until"] = 0.0
             self.write("Losing-streak pause lifted.", "good")

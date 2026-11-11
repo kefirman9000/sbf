@@ -6383,10 +6383,10 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
 
         def bring():
             if not self.tourn or not self.seeded:
-                return self._nothing(parent, "Training camp", "Start your farm first (Wildcard), then bring the bots over.", parent=w)
+                return messagebox.showinfo("Training camp", "Start your farm first (Wildcard), then bring the bots over.", parent=w)
             picks = chosen()
             if not picks:
-                return self._nothing(parent, "Training camp", "No bots passed. Select rows to bring some anyway.", parent=w)
+                return messagebox.showinfo("Training camp", "No bots passed. Select rows to bring some anyway.", parent=w)
             closes = {c_: self.hist[c_] for c_ in self.session_coins}
             n = 0
             for r in picks:
@@ -6411,7 +6411,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
 
         def teach():
             if not self.tourn:
-                return self._nothing(parent, "Training camp", "Start your farm first (Wildcard).", parent=w)
+                return messagebox.showinfo("Training camp", "Start your farm first (Wildcard).", parent=w)
             E.teach_from(self.tourn, st["res"]["tourn"])
             self.save_farm(force=True)
             self.write("Your farm learned from the training camp: elders, post-trade review, mutation memory and season champions.", "good")
@@ -6419,7 +6419,7 @@ class App(FarmAppMixin, FillCheckMixin, NavMixin):
         def save_lib():
             picks = chosen()
             if not picks:
-                return self._nothing(parent, "Training camp", "No bots passed. Select rows to save some anyway.", parent=w)
+                return messagebox.showinfo("Training camp", "No bots passed. Select rows to save some anyway.", parent=w)
             t = st["res"]["tourn"]
             ids = {id(r["v"]) for r in picks}
             rows = [dict(r, bar_minutes=st["res"]["gran"] / 60) for r in t.board() if id(r["v"]) in ids]
